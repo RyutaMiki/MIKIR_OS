@@ -11,28 +11,41 @@
 | **kernel/kernel.c** | **C** | 32bit カーネル。VGA (0xb8000) に "MIKIR-OS (C kernel)" を表示。 |
 | **link.ld** | - | ローダとカーネルのリンクスクリプト。 |
 
-## 必要環境
+## 動かす手順（手元で実行する場合）
 
-- **nasm**: `brew install nasm`
-- **gcc**（32bit 対応）: macOS では `brew install gcc` や x86 用ツールチェーンが必要な場合あり
-- **make**
-- **QEMU**: `brew install qemu`
-
-## ビルド
+**1. 必要なツールを入れる（macOS）**
 
 ```bash
-make
+brew install nasm qemu
+# カーネル用の x86 32bit コンパイラ（どちらか）
+brew install i686-elf-gcc   # Apple Silicon (M1/M2/M4) の場合はこちら
+# または（Intel Mac など gcc -m32 が使える環境）
+brew install gcc
 ```
 
-生成: `mikiros.img`（1.44MB フロッピーイメージ）
+- **Apple Silicon (M1/M2/M4)**: `gcc -m32` では x86 向けが出せないため、**i686-elf-gcc** が必須です。
+- Homebrew で権限エラーが出る場合は、表示された `sudo chown` を実行してから再度 `brew install`。
 
-## 実行
+**2. ビルドと実行**
 
 ```bash
+cd MIKIR_OS
+make
 make run
 ```
 
-起動後、画面上部に「MIKIR-OS (C kernel)」が表示されます（32bit プロテクトモードで C が動作）。
+- `make` で `mikiros.img` ができる。
+- `make run` で QEMU が起動する（第1ディスクとして `mikiros.img` を接続）。画面上部に **「MIKIR-OS (C kernel)」** が出れば成功。
+- 終了: QEMU ウィンドウで `Ctrl+C` または閉じる。
+
+**注意**: Apple Silicon (M1/M2/M4) では `brew install i686-elf-gcc` を先に入れておくと、Makefile が自動でクロスコンパイラを使います。
+
+## 必要環境（一覧）
+
+- **nasm**: アセンブラ
+- **gcc**（32bit 対応）: カーネル用
+- **make**
+- **QEMU**: 実行確認用
 
 ## ロードマップ
 

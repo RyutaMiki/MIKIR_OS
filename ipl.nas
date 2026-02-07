@@ -5,7 +5,7 @@
 		ORG		0x7c00
 
 ; ----------------------------------------------------------------------
-; FAT12 BPB (BIOS Parameter Block) - required for floppy
+; FAT12 BPB (BIOS Parameter Block) - for compatibility
 ; ----------------------------------------------------------------------
 		JMP		entry
 		DB		0x90
@@ -29,7 +29,8 @@
 		RESB	18
 
 ; ----------------------------------------------------------------------
-; Entry: set segment registers, load sector 2 to 0x8000, jump to loader
+; Entry: set segment registers, load sector 1..4 (LBA) to 0x8000, jump to loader
+; Use Extended Read (AH=42h) so HDD geometry does not matter.
 ; ----------------------------------------------------------------------
 entry:
 		MOV		AX, 0
@@ -38,22 +39,24 @@ entry:
 		MOV		DS, AX
 		MOV		ES, AX
 
-		; INT 0x13 AH=0x02: read sectors
-		; CH=cylinder(0), CL=sector(2, 1-based), DH=head(0), DL=drive(BIOS)
-		; ES:BX = buffer -> 0x8000:0
-		MOV		AX, 0x0800
-		MOV		ES, AX
-		MOV		CH, 0
-		MOV		DH, 0
-		MOV		CL, 2
-		MOV		BX, 0
-		MOV		AL, 4
-		MOV		AH, 0x02
+		; INT 0x13 AH=0x42: Extended Read (LBA). DS:SI = DAP, DL = drive (BIOS)
+		MOV		SI, dap
+		MOV		AH, 0x42
 		INT		0x13
 		JC		error
 
 		; Jump to loader at 0x8000:0
 		JMP		0x8000:0
+
+; Disk Address Packet for LBA read: sector 1, 4 sectors -> 0x8000:0
+dap:
+		DB		0x10		; size of DAP
+		DB		0			; reserved
+		DW		4			; sector count
+		DW		0			; buffer offset
+		DW		0x8000		; buffer segment
+		DD		1			; LBA low (sector 1 = 2nd sector)
+		DD		0			; LBA high
 
 error:
 		MOV		SI, msg_error

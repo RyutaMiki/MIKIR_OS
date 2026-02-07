@@ -9,5 +9,5 @@ SECTIONS
 	.text      : { *(.text) }
 	.data      : { *(.data) }
 	.bss       : { *(.bss) }
-	/DISCARD/  : { *(.note*)(.*) }
+	/DISCARD/  : { *(.note*) *(.comment) }
 }
