@@ -125,10 +125,10 @@ isr_keyboard:
 		IRET
 
 ; ---------------------------------------------------------------------------
-; Fill IDT (256 entries) at 0x81000, all pointing to idt_stub
+; Fill IDT (256 entries) at 0x70000, all pointing to idt_stub
 ; ---------------------------------------------------------------------------
 setup_idt:
-		MOV		EDI, 0x81000
+		MOV		EDI, 0x70000
 		MOV		ECX, 256
 		MOV		EAX, idt_stub		; VMA already = linear addr (flat GDT)
 .fill:
@@ -145,7 +145,7 @@ setup_idt:
 
 		SUB		ESP, 6
 		MOV		WORD [ESP], 256*8 - 1
-		MOV		DWORD [ESP+2], 0x81000
+		MOV		DWORD [ESP+2], 0x70000
 		LIDT	[ESP]
 		ADD		ESP, 6
 		RET

@@ -50,10 +50,11 @@ $(KERNEL_ELF): $(LOADER) $(KERNEL_O)
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
 
-$(IMAGE): $(IPL) $(KERNEL_BIN)
+$(IMAGE): $(IPL) $(KERNEL_BIN) mkfs.py
 	dd if=/dev/zero of=$(IMAGE) bs=512 count=$(SECTORS) 2>/dev/null
 	dd if=$(IPL) of=$(IMAGE) bs=512 conv=notrunc
 	dd if=$(KERNEL_BIN) of=$(IMAGE) bs=512 seek=1 conv=notrunc
+	python3 mkfs.py $(IMAGE)
 
 clean:
 	rm -f $(IPL) $(LOADER) $(KERNEL_O) $(KERNEL_ELF) $(KERNEL_BIN) $(IMAGE)
