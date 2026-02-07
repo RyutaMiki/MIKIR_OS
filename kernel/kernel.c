@@ -7,8 +7,9 @@
 #define VGA_COLS      80
 #define VGA_ROWS      25
 #define VGA_ATTR      0x0f   /* white on black */
-#define PROMPT_ATTR   0x0a   /* green on black */
 #define CMD_BUF_SIZE  64
+#define KBD_BUF_SIZE  32
+#define TIMER_HZ      100
 
 static volatile unsigned short *const vga = (volatile unsigned short *)0xb8000;
 
@@ -26,7 +27,12 @@ static inline void outb(unsigned short port, unsigned char val)
 	__asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-/* ---- Scan code set 1 → ASCII (US layout, lowercase) ---- */
+static inline void io_wait(void)
+{
+	outb(0x80, 0);   /* port 0x80 gives a short delay */
+}
+
+/* ---- Scan code set 1 -> ASCII (US layout, lowercase) ---- */
 
 static const char sc_to_ascii[128] = {
 	 0,  27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',  /* 00-0E */
@@ -35,6 +41,15 @@ static const char sc_to_ascii[128] = {
 	 0,  '\\','z','x','c','v','b','n','m',',','.','/', 0,           /* 2A-36 */
 	'*', 0, ' '                                                      /* 37-39 */
 };
+
+/* ---- Keyboard ring buffer (producer: IRQ handler, consumer: main loop) ---- */
+
+static volatile char    kbd_buf[KBD_BUF_SIZE];
+static volatile int     kbd_head, kbd_tail;
+
+/* ---- Timer tick counter ---- */
+
+static volatile unsigned int ticks;
 
 /* ---- VGA text mode ---- */
 
@@ -88,21 +103,17 @@ static void vga_puts(const char *s)
 		vga_putchar(*s++);
 }
 
-/* Put a character with a specific attribute (for coloured prompt) */
-static void vga_putchar_attr(char c, unsigned char attr)
+static void vga_putint(unsigned n)
 {
-	vga[cur_y * VGA_COLS + cur_x] = ((unsigned short)attr << 8) | (unsigned char)c;
-	cur_x++;
-	if (cur_x >= VGA_COLS) { cur_x = 0; cur_y++; }
-	if (cur_y >= VGA_ROWS)
-		vga_scroll();
-	vga_update_cursor();
-}
-
-static void vga_puts_attr(const char *s, unsigned char attr)
-{
-	while (*s)
-		vga_putchar_attr(*s++, attr);
+	char buf[12];
+	int i = 0;
+	if (n == 0) { vga_putchar('0'); return; }
+	while (n > 0) {
+		buf[i++] = '0' + (n % 10);
+		n /= 10;
+	}
+	while (--i >= 0)
+		vga_putchar(buf[i]);
 }
 
 static void vga_clear(void)
@@ -114,20 +125,94 @@ static void vga_clear(void)
 	vga_update_cursor();
 }
 
-/* ---- Keyboard (polling) ---- */
+/* ---- PIC (8259) initialization ---- */
+
+static void pic_init(void)
+{
+	/* ICW1: start init, expect ICW4 */
+	outb(0x20, 0x11);  io_wait();
+	outb(0xA0, 0x11);  io_wait();
+
+	/* ICW2: vector offset */
+	outb(0x21, 0x20);  io_wait();   /* master: IRQ 0-7 -> INT 0x20-0x27 */
+	outb(0xA1, 0x28);  io_wait();   /* slave:  IRQ 8-15 -> INT 0x28-0x2F */
+
+	/* ICW3: master/slave wiring */
+	outb(0x21, 0x04);  io_wait();   /* master: slave on IRQ2 */
+	outb(0xA1, 0x02);  io_wait();   /* slave:  cascade identity */
+
+	/* ICW4: 8086 mode */
+	outb(0x21, 0x01);  io_wait();
+	outb(0xA1, 0x01);  io_wait();
+
+	/* Mask: unmask IRQ0 (timer) and IRQ1 (keyboard) only */
+	outb(0x21, 0xFC);   /* master: 11111100 */
+	outb(0xA1, 0xFF);   /* slave:  all masked */
+}
+
+/* ---- PIT (8253/8254) timer ---- */
+
+static void pit_init(unsigned hz)
+{
+	unsigned short div = (unsigned short)(1193182 / hz);
+	outb(0x43, 0x34);               /* channel 0, lo/hi, rate generator */
+	outb(0x40, div & 0xFF);
+	outb(0x40, (div >> 8) & 0xFF);
+}
+
+/* ---- IDT gate setter (overwrite entry in IDT at 0x81000) ---- */
+
+struct idt_entry {
+	unsigned short offset_low;
+	unsigned short selector;
+	unsigned char  zero;
+	unsigned char  type_attr;
+	unsigned short offset_high;
+} __attribute__((packed));
+
+static void idt_set_gate(int n, unsigned handler)
+{
+	volatile struct idt_entry *idt = (volatile struct idt_entry *)0x81000;
+	idt[n].offset_low  = handler & 0xFFFF;
+	idt[n].selector    = 0x08;
+	idt[n].zero        = 0;
+	idt[n].type_attr   = 0x8E;   /* present, ring 0, 32-bit interrupt gate */
+	idt[n].offset_high = (handler >> 16) & 0xFFFF;
+}
+
+/* ---- Interrupt handlers (called from asm ISR stubs in loader.nas) ---- */
+
+extern void isr_timer(void);
+extern void isr_keyboard(void);
+
+void timer_handler(void)
+{
+	ticks++;
+}
+
+void keyboard_handler(void)
+{
+	unsigned char sc = inb(0x60);
+	if (sc & 0x80)           /* key release */
+		return;
+	if (sc < sizeof(sc_to_ascii) && sc_to_ascii[sc]) {
+		int next = (kbd_head + 1) % KBD_BUF_SIZE;
+		if (next != kbd_tail) {          /* buffer not full */
+			kbd_buf[kbd_head] = sc_to_ascii[sc];
+			kbd_head = next;
+		}
+	}
+}
+
+/* ---- Keyboard (interrupt-driven) ---- */
 
 static char kbd_getchar(void)
 {
-	unsigned char sc;
-	for (;;) {
-		while (!(inb(0x64) & 1))
-			;
-		sc = inb(0x60);
-		if (sc & 0x80)          /* key release → ignore */
-			continue;
-		if (sc < sizeof(sc_to_ascii) && sc_to_ascii[sc])
-			return sc_to_ascii[sc];
-	}
+	while (kbd_head == kbd_tail)
+		__asm__ volatile ("hlt");        /* sleep until interrupt */
+	char c = kbd_buf[kbd_tail];
+	kbd_tail = (kbd_tail + 1) % KBD_BUF_SIZE;
+	return c;
 }
 
 /* ---- String helpers ---- */
@@ -151,7 +236,7 @@ static int starts_with(const char *s, const char *prefix)
 
 static void print_prompt(void)
 {
-	vga_puts_attr("C:\\>", VGA_ATTR);
+	vga_puts("C:\\>");
 }
 
 static void shell_exec(char *cmd)
@@ -167,6 +252,7 @@ static void shell_exec(char *cmd)
 		vga_puts("  ver     - Show version\n");
 		vga_puts("  clear   - Clear screen\n");
 		vga_puts("  echo .. - Echo text\n");
+		vga_puts("  uptime  - Show uptime\n");
 	} else if (my_strcmp(cmd, "ver") == 0) {
 		vga_puts("Chocola Ver0.1\n");
 	} else if (my_strcmp(cmd, "clear") == 0) {
@@ -176,6 +262,17 @@ static void shell_exec(char *cmd)
 		vga_putchar('\n');
 	} else if (my_strcmp(cmd, "echo") == 0) {
 		vga_putchar('\n');
+	} else if (my_strcmp(cmd, "uptime") == 0) {
+		unsigned t = ticks;
+		unsigned sec = t / TIMER_HZ;
+		unsigned min = sec / 60;
+		sec %= 60;
+		vga_putint(min);
+		vga_puts("m ");
+		vga_putint(sec);
+		vga_puts("s (");
+		vga_putint(t);
+		vga_puts(" ticks)\n");
 	} else {
 		vga_puts("Unknown command: ");
 		vga_puts(cmd);
@@ -222,6 +319,16 @@ static void shell_run(void)
 void kernel_main(void)
 {
 	vga_clear();
+
+	/* Set up interrupts */
+	pic_init();
+	pit_init(TIMER_HZ);
+	idt_set_gate(0x20, (unsigned)isr_timer);
+	idt_set_gate(0x21, (unsigned)isr_keyboard);
+
+	/* Enable interrupts */
+	__asm__ volatile ("sti");
+
 	vga_puts("Chocola Ver0.1\n");
 	vga_puts("Type 'help' for available commands.\n\n");
 	shell_run();

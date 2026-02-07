@@ -54,7 +54,6 @@ msg_loader:
 
 ; ---------------------------------------------------------------------------
 ; GDT: both code and data are flat (base=0, limit=4GB)
-; With link.ld, 32-bit symbols already carry the correct linear address.
 ; ---------------------------------------------------------------------------
 align 8
 gdt:
@@ -85,6 +84,10 @@ gdtr:
 [SECTION .text]
 [BITS 32]
 		GLOBAL	start_32
+		GLOBAL	isr_timer
+		GLOBAL	isr_keyboard
+		EXTERN	timer_handler
+		EXTERN	keyboard_handler
 
 start_32:
 		MOV		AX, 0x10
@@ -102,7 +105,28 @@ start_32:
 .hlt:	HLT
 		JMP		.hlt
 
+; ---------------------------------------------------------------------------
+; ISR stubs: save all regs, call C handler, send EOI, restore, IRET
+; ---------------------------------------------------------------------------
+isr_timer:
+		PUSHAD
+		CALL	timer_handler
+		MOV		AL, 0x20
+		OUT		0x20, AL		; EOI to master PIC
+		POPAD
+		IRET
+
+isr_keyboard:
+		PUSHAD
+		CALL	keyboard_handler
+		MOV		AL, 0x20
+		OUT		0x20, AL		; EOI to master PIC
+		POPAD
+		IRET
+
+; ---------------------------------------------------------------------------
 ; Fill IDT (256 entries) at 0x81000, all pointing to idt_stub
+; ---------------------------------------------------------------------------
 setup_idt:
 		MOV		EDI, 0x81000
 		MOV		ECX, 256
