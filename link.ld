@@ -1,4 +1,4 @@
-/* MIKIR-OS: loaded at 0x8000:0 (linear 0x80000). GDT base set to 0x80000. */
+/* MIKIR-OS: loaded at 0x8000:0 (linear 0x80000). Link at 0x80000 so C data addresses are correct. */
 OUTPUT_FORMAT("elf32-i386")
 ENTRY(_start)
 
