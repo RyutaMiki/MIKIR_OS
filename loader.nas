@@ -134,7 +134,9 @@ start_32:
 ; ---------------------------------------------------------------------------
 isr_timer:
 		PUSHAD
-		CALL	timer_handler
+		PUSH	ESP				; arg: current ESP (-> PUSHAD frame)
+		CALL	timer_handler	; returns new ESP in EAX
+		MOV		ESP, EAX		; switch stack (may be same or different task)
 		MOV		AL, 0x20
 		OUT		0x20, AL		; EOI to master PIC
 		POPAD

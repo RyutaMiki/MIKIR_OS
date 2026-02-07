@@ -14,6 +14,9 @@
 #define HEAP_START    0x200000   /* 2 MB */
 #define HEAP_SIZE     0x200000   /* 2 MB */
 
+#define MAX_TASKS      4
+#define TASK_STACK_SIZE 4096
+
 #define FS_DIR_SECTOR 100    /* sector holding the file directory */
 #define FS_MAX_FILES  16     /* max entries in one sector (512/32) */
 #define FILE_BUF_SIZE 2048   /* max file size for write command */
@@ -279,14 +282,121 @@ static void kfree(void *ptr)
 	}
 }
 
+/* ---- Task management (preemptive multitasking) ---- */
+
+struct task {
+	unsigned esp;
+	int      active;
+	char     name[16];
+};
+
+static struct task tasks[MAX_TASKS];
+static int current_task;
+static int num_tasks;
+
+static void my_strcpy(char *dst, const char *src)
+{
+	while (*src) *dst++ = *src++;
+	*dst = 0;
+}
+
+static void task_exit(void)
+{
+	tasks[current_task].active = 0;
+	for (;;) __asm__ volatile ("hlt");
+}
+
+static void task_init_main(void)
+{
+	my_strcpy(tasks[0].name, "shell");
+	tasks[0].active = 1;
+	tasks[0].esp    = 0;   /* will be saved on first context switch */
+	current_task = 0;
+	num_tasks    = 1;
+}
+
+static int task_create(void (*func)(void), const char *name)
+{
+	unsigned *sp;
+	int id;
+
+	if (num_tasks >= MAX_TASKS) return -1;
+
+	id = num_tasks;
+	sp = (unsigned *)((unsigned char *)kmalloc(TASK_STACK_SIZE) + TASK_STACK_SIZE);
+
+	/* fake stack: when POPAD + IRET execute, the task starts at func() */
+	*(--sp) = (unsigned)task_exit;   /* return addr when func() returns */
+	*(--sp) = 0x202;                /* EFLAGS  (IF=1) */
+	*(--sp) = 0x08;                 /* CS */
+	*(--sp) = (unsigned)func;       /* EIP */
+	*(--sp) = 0;  /* EAX */
+	*(--sp) = 0;  /* ECX */
+	*(--sp) = 0;  /* EDX */
+	*(--sp) = 0;  /* EBX */
+	*(--sp) = 0;  /* ESP (ignored by POPAD) */
+	*(--sp) = 0;  /* EBP */
+	*(--sp) = 0;  /* ESI */
+	*(--sp) = 0;  /* EDI */
+
+	tasks[id].esp    = (unsigned)sp;
+	tasks[id].active = 1;
+	my_strcpy(tasks[id].name, name);
+	num_tasks++;
+	return id;
+}
+
+/* Background task: clock display in the top-right corner */
+static void task_clock(void)
+{
+	unsigned last_sec = 0xFFFFFFFF;
+	for (;;) {
+		unsigned t = ticks;
+		unsigned sec = t / TIMER_HZ;
+		if (sec != last_sec) {
+			unsigned min, hr;
+			volatile unsigned short *v = (volatile unsigned short *)0xb8000;
+			int col = VGA_COLS - 8;
+			last_sec = sec;
+			min = sec / 60;
+			hr  = min / 60;
+			sec %= 60;
+			min %= 60;
+			v[col+0] = 0x0e00 | ('0' + hr/10);
+			v[col+1] = 0x0e00 | ('0' + hr%10);
+			v[col+2] = 0x0e00 | ':';
+			v[col+3] = 0x0e00 | ('0' + min/10);
+			v[col+4] = 0x0e00 | ('0' + min%10);
+			v[col+5] = 0x0e00 | ':';
+			v[col+6] = 0x0e00 | ('0' + sec/10);
+			v[col+7] = 0x0e00 | ('0' + sec%10);
+		}
+		__asm__ volatile ("hlt");
+	}
+}
+
 /* ---- Interrupt handlers ---- */
 
 extern void isr_timer(void);
 extern void isr_keyboard(void);
 
-void timer_handler(void)
+unsigned timer_handler(unsigned esp)
 {
+	int next;
 	ticks++;
+
+	if (num_tasks <= 1) return esp;
+
+	tasks[current_task].esp = esp;
+
+	/* round-robin: find next active task */
+	next = current_task;
+	do {
+		next = (next + 1) % num_tasks;
+	} while (!tasks[next].active && next != current_task);
+
+	current_task = next;
+	return tasks[current_task].esp;
 }
 
 void keyboard_handler(void)
@@ -580,6 +690,27 @@ static void cmd_del(const char *filename)
 	vga_putchar('\n');
 }
 
+/* ---- Task commands ---- */
+
+static void cmd_ps(void)
+{
+	int i, len;
+	const char *p;
+	vga_puts("  ID  Name         Status\n");
+	for (i = 0; i < num_tasks; i++) {
+		vga_puts("  ");
+		vga_putint((unsigned)i);
+		vga_puts("   ");
+		vga_puts(tasks[i].name);
+		len = 0; p = tasks[i].name;
+		while (*p++) len++;
+		while (len++ < 13) vga_putchar(' ');
+		if (i == current_task)      vga_puts("running\n");
+		else if (tasks[i].active)   vga_puts("ready\n");
+		else                        vga_puts("stopped\n");
+	}
+}
+
 /* ---- Memory commands ---- */
 
 static void cmd_mem(void)
@@ -680,6 +811,9 @@ static void shell_exec(char *cmd)
 		vga_puts("  del FILE    - Delete file\n");
 		vga_puts("  mem         - Memory info\n");
 		vga_puts("  memtest     - Test malloc/free\n");
+		vga_puts("  clock       - Start clock task\n");
+		vga_puts("  ps          - List tasks\n");
+		vga_puts("  kill N      - Kill task N\n");
 	} else if (my_strcmp(cmd, "ver") == 0) {
 		vga_puts("Chocola Ver0.1\n");
 	} else if (my_strcmp(cmd, "clear") == 0) {
@@ -714,6 +848,23 @@ static void shell_exec(char *cmd)
 		cmd_mem();
 	} else if (my_strcmp(cmd, "memtest") == 0) {
 		cmd_memtest();
+	} else if (my_strcmp(cmd, "clock") == 0) {
+		if (task_create(task_clock, "clock") >= 0)
+			vga_puts("Clock task started.\n");
+		else
+			vga_puts("Cannot create task (max reached).\n");
+	} else if (my_strcmp(cmd, "ps") == 0) {
+		cmd_ps();
+	} else if (starts_with(cmd, "kill ")) {
+		int id = cmd[5] - '0';
+		if (id > 0 && id < num_tasks && tasks[id].active) {
+			tasks[id].active = 0;
+			vga_puts("Killed task ");
+			vga_putint((unsigned)id);
+			vga_putchar('\n');
+		} else {
+			vga_puts("Invalid task ID.\n");
+		}
 	} else {
 		vga_puts("Unknown command: ");
 		vga_puts(cmd);
@@ -762,6 +913,7 @@ void kernel_main(void)
 	vga_clear();
 
 	heap_init();
+	task_init_main();
 	pic_init();
 	pit_init(TIMER_HZ);
 	idt_set_gate(0x20, (unsigned)isr_timer);
