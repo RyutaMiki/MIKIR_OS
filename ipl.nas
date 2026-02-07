@@ -52,7 +52,7 @@ entry:
 dap:
 		DB		0x10		; size of DAP
 		DB		0			; reserved
-		DW		4			; sector count
+		DW		16			; sector count (8KB – enough for loader+kernel)
 		DW		0			; buffer offset
 		DW		0x8000		; buffer segment
 		DD		1			; LBA low (sector 1 = 2nd sector)

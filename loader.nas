@@ -1,4 +1,4 @@
-; MIKIR-OS Loader (second stage)
+; chocola Loader (second stage)
 ; Loaded at 0x8000:0 by IPL. Switches to 32-bit protected mode and calls kernel_main (C).
 ; TAB=4
 
@@ -17,6 +17,7 @@ _start:
 		; Tell user we reached the loader (real mode)
 		MOV		SI, msg_loader
 		CALL	putstr_16
+
 		; Load GDT
 		LGDT	[gdtr]
 
@@ -25,7 +26,7 @@ _start:
 		OR		AL, 2
 		OUT		0x92, AL
 
-		; Disable interrupts before PMode (no IDT yet -> timer would triple-fault)
+		; Disable interrupts before PMode
 		CLI
 
 		; Protected mode
@@ -33,7 +34,7 @@ _start:
 		OR		EAX, 1
 		MOV		CR0, EAX
 
-		; Far jump to 32-bit code (selector 0x08 = code)
+		; Far jump to 32-bit code (selector 0x08 = flat code)
 		JMP		DWORD 0x08:start_32
 
 putstr_16:
@@ -47,25 +48,29 @@ putstr_16:
 		JMP		.1
 .2:		POP		SI
 		RET
+
 msg_loader:
 		DB		0x0a, 0x0a, "Loader OK (16bit)", 0x0a, 0
 
-; GDT: code at 0x80000, data flat 0..4GB
+; ---------------------------------------------------------------------------
+; GDT: both code and data are flat (base=0, limit=4GB)
+; With link.ld, 32-bit symbols already carry the correct linear address.
+; ---------------------------------------------------------------------------
 align 8
 gdt:
 		DQ		0
 gdt_code:
-		DW		0xffff
-		DW		0x0000
-		DB		0x08
-		DB		0x9a
-		DB		0xcf
-		DB		0x00
+		DW		0xffff			; limit 15:0
+		DW		0x0000			; base 15:0
+		DB		0x00			; base 23:16
+		DB		0x9a			; P=1 DPL=0 S=1 type=exec/read
+		DB		0xcf			; G=1 D=1 limit 19:16=0xf
+		DB		0x00			; base 31:24
 gdt_data:
 		DW		0xffff
 		DW		0x0000
 		DB		0x00
-		DB		0x92
+		DB		0x92			; P=1 DPL=0 S=1 type=data/write
 		DB		0xcf
 		DB		0x00
 gdt_end:
@@ -74,9 +79,13 @@ gdtr:
 		DW		gdt_end - gdt - 1
 		DD		0x80000 + (gdt - _start)
 
+; ---------------------------------------------------------------------------
+; 32-bit protected mode
+; ---------------------------------------------------------------------------
 [SECTION .text]
 [BITS 32]
 		GLOBAL	start_32
+
 start_32:
 		MOV		AX, 0x10
 		MOV		DS, AX
@@ -86,23 +95,8 @@ start_32:
 		MOV		SS, AX
 		MOV		ESP, 0x90000
 
-		; Clear screen then write "32OK" at top-left (VGA 0xb8000)
-		MOV		EDI, 0xb8000
-		MOV		ECX, 80*25
-		MOV		AX, 0x0f20
-.clr:	MOV		[EDI], AX
-		ADD		EDI, 2
-		LOOP	.clr
-		MOV		EDI, 0xb8000
-		MOV		WORD [EDI], 0x0f33
-		MOV		WORD [EDI+2], 0x0f32
-		MOV		WORD [EDI+4], 0x0f4f
-		MOV		WORD [EDI+6], 0x0f4b
-
 		CALL	setup_idt
-		PUSH	0x80000
 		CALL	kernel_main
-		ADD		ESP, 4
 
 		CLI
 .hlt:	HLT
@@ -112,8 +106,7 @@ start_32:
 setup_idt:
 		MOV		EDI, 0x81000
 		MOV		ECX, 256
-		MOV		EAX, idt_stub
-		ADD		EAX, 0x80000
+		MOV		EAX, idt_stub		; VMA already = linear addr (flat GDT)
 .fill:
 		MOV		[EDI], AX
 		MOV		WORD [EDI+2], 0x08
@@ -125,6 +118,7 @@ setup_idt:
 		POP		EAX
 		ADD		EDI, 8
 		LOOP	.fill
+
 		SUB		ESP, 6
 		MOV		WORD [ESP], 256*8 - 1
 		MOV		DWORD [ESP+2], 0x81000
