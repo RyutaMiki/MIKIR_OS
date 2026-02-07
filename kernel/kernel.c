@@ -11,6 +11,9 @@
 #define KBD_BUF_SIZE  32
 #define TIMER_HZ      100
 
+#define HEAP_START    0x200000   /* 2 MB */
+#define HEAP_SIZE     0x200000   /* 2 MB */
+
 #define FS_DIR_SECTOR 100    /* sector holding the file directory */
 #define FS_MAX_FILES  16     /* max entries in one sector (512/32) */
 #define FILE_BUF_SIZE 2048   /* max file size for write command */
@@ -146,6 +149,15 @@ static void vga_putint(unsigned n)
 		vga_putchar(buf[i]);
 }
 
+static void vga_puthex(unsigned n)
+{
+	static const char hex[] = "0123456789abcdef";
+	int i;
+	vga_puts("0x");
+	for (i = 28; i >= 0; i -= 4)
+		vga_putchar(hex[(n >> i) & 0xF]);
+}
+
 static void vga_clear(void)
 {
 	int i;
@@ -199,6 +211,72 @@ static void idt_set_gate(int n, unsigned handler)
 	idt[n].zero        = 0;
 	idt[n].type_attr   = 0x8E;
 	idt[n].offset_high = (handler >> 16) & 0xFFFF;
+}
+
+/* ---- E820 memory map (filled by loader in real mode at linear 0x500) ---- */
+
+struct e820_entry {
+	unsigned int base_lo, base_hi;
+	unsigned int len_lo, len_hi;
+	unsigned int type;
+	unsigned int acpi;
+} __attribute__((packed));
+
+/* ---- Heap allocator ---- */
+
+struct heap_block {
+	unsigned int size;
+	unsigned int used;
+	struct heap_block *next;
+};
+
+static struct heap_block *heap_head;
+
+static void heap_init(void)
+{
+	heap_head = (struct heap_block *)HEAP_START;
+	heap_head->size = HEAP_SIZE - sizeof(struct heap_block);
+	heap_head->used = 0;
+	heap_head->next = 0;
+}
+
+static void *kmalloc(unsigned size)
+{
+	struct heap_block *block, *nb;
+
+	size = (size + 3) & ~3;   /* align to 4 bytes */
+
+	for (block = heap_head; block; block = block->next) {
+		if (!block->used && block->size >= size) {
+			/* split if enough room for another block */
+			if (block->size > size + sizeof(struct heap_block) + 4) {
+				nb = (struct heap_block *)((unsigned char *)block
+				      + sizeof(struct heap_block) + size);
+				nb->size = block->size - size - sizeof(struct heap_block);
+				nb->used = 0;
+				nb->next = block->next;
+				block->size = size;
+				block->next = nb;
+			}
+			block->used = 1;
+			return (void *)((unsigned char *)block + sizeof(struct heap_block));
+		}
+	}
+	return 0;   /* out of memory */
+}
+
+static void kfree(void *ptr)
+{
+	struct heap_block *block;
+	if (!ptr) return;
+	block = (struct heap_block *)((unsigned char *)ptr - sizeof(struct heap_block));
+	block->used = 0;
+
+	/* coalesce with next free block(s) */
+	while (block->next && !block->next->used) {
+		block->size += sizeof(struct heap_block) + block->next->size;
+		block->next = block->next->next;
+	}
 }
 
 /* ---- Interrupt handlers ---- */
@@ -502,6 +580,80 @@ static void cmd_del(const char *filename)
 	vga_putchar('\n');
 }
 
+/* ---- Memory commands ---- */
+
+static void cmd_mem(void)
+{
+	unsigned short e820_count = *(volatile unsigned short *)0x500;
+	struct e820_entry *e = (struct e820_entry *)0x504;
+	unsigned total_kb = 0;
+	struct heap_block *block;
+	unsigned heap_used = 0, heap_free = 0;
+	int i;
+
+	vga_puts("Memory Map (E820):\n");
+	for (i = 0; i < e820_count && i < 20; i++) {
+		vga_puts("  ");
+		vga_puthex(e[i].base_lo);
+		vga_puts(" - ");
+		vga_puthex(e[i].base_lo + e[i].len_lo);
+		switch (e[i].type) {
+		case 1:  vga_puts(" usable");   total_kb += e[i].len_lo / 1024; break;
+		case 2:  vga_puts(" reserved"); break;
+		case 3:  vga_puts(" ACPI");     break;
+		default: vga_puts(" other");    break;
+		}
+		vga_putchar('\n');
+	}
+	if (e820_count == 0)
+		vga_puts("  (not available)\n");
+
+	vga_puts("Total usable: ");
+	vga_putint(total_kb);
+	vga_puts(" KB (");
+	vga_putint(total_kb / 1024);
+	vga_puts(" MB)\n\n");
+
+	vga_puts("Heap (2 MB at 0x200000):\n");
+	for (block = heap_head; block; block = block->next) {
+		if (block->used) heap_used += block->size;
+		else             heap_free += block->size;
+	}
+	vga_puts("  Used: ");  vga_putint(heap_used);  vga_puts(" bytes\n");
+	vga_puts("  Free: ");  vga_putint(heap_free);  vga_puts(" bytes\n");
+}
+
+static void cmd_memtest(void)
+{
+	void *a, *b, *c;
+
+	vga_puts("malloc(100)... ");
+	a = kmalloc(100);
+	if (a) { vga_puts("OK at "); vga_puthex((unsigned)a); vga_putchar('\n'); }
+	else   { vga_puts("FAIL\n"); return; }
+
+	vga_puts("malloc(200)... ");
+	b = kmalloc(200);
+	if (b) { vga_puts("OK at "); vga_puthex((unsigned)b); vga_putchar('\n'); }
+	else   { vga_puts("FAIL\n"); return; }
+
+	vga_puts("free(first)... ");
+	kfree(a);
+	vga_puts("OK\n");
+
+	vga_puts("malloc(50)...  ");
+	c = kmalloc(50);
+	if (c) {
+		vga_puts("OK at "); vga_puthex((unsigned)c);
+		if (c == a) vga_puts(" (reused!)");
+		vga_putchar('\n');
+	} else { vga_puts("FAIL\n"); return; }
+
+	kfree(b);
+	kfree(c);
+	vga_puts("All tests passed.\n");
+}
+
 /* ---- Shell ---- */
 
 static void print_prompt(void)
@@ -526,6 +678,8 @@ static void shell_exec(char *cmd)
 		vga_puts("  type FILE   - Display file\n");
 		vga_puts("  write FILE  - Create file\n");
 		vga_puts("  del FILE    - Delete file\n");
+		vga_puts("  mem         - Memory info\n");
+		vga_puts("  memtest     - Test malloc/free\n");
 	} else if (my_strcmp(cmd, "ver") == 0) {
 		vga_puts("Chocola Ver0.1\n");
 	} else if (my_strcmp(cmd, "clear") == 0) {
@@ -556,6 +710,10 @@ static void shell_exec(char *cmd)
 		cmd_write(cmd + 6);
 	} else if (starts_with(cmd, "del ")) {
 		cmd_del(cmd + 4);
+	} else if (my_strcmp(cmd, "mem") == 0) {
+		cmd_mem();
+	} else if (my_strcmp(cmd, "memtest") == 0) {
+		cmd_memtest();
 	} else {
 		vga_puts("Unknown command: ");
 		vga_puts(cmd);
@@ -603,6 +761,7 @@ void kernel_main(void)
 {
 	vga_clear();
 
+	heap_init();
 	pic_init();
 	pit_init(TIMER_HZ);
 	idt_set_gate(0x20, (unsigned)isr_timer);

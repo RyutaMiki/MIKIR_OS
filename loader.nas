@@ -26,6 +26,30 @@ _start:
 		OR		AL, 2
 		OUT		0x92, AL
 
+		; Detect memory map (INT 15h, E820) — store at linear 0x500
+		PUSH	ES
+		XOR		AX, AX
+		MOV		ES, AX
+		XOR		BP, BP			; entry count
+		MOV		DI, 0x504		; entries start at 0x504
+		XOR		EBX, EBX		; continuation = 0
+.e820:
+		MOV		EAX, 0xE820
+		MOV		ECX, 24
+		MOV		EDX, 0x534D4150	; 'SMAP'
+		INT		0x15
+		JC		.e820_end
+		CMP		EAX, 0x534D4150
+		JNE		.e820_end
+		INC		BP
+		ADD		DI, 24
+		TEST	EBX, EBX
+		JNZ		.e820
+.e820_end:
+		MOV		[ES:0x500], BP	; store count (16-bit)
+		MOV		WORD [ES:0x502], 0
+		POP		ES
+
 		; Disable interrupts before PMode
 		CLI
 
