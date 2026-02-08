@@ -60,4 +60,4 @@ clean:
 	rm -f $(IPL) $(LOADER) $(KERNEL_O) $(KERNEL_ELF) $(KERNEL_BIN) $(IMAGE)
 
 run: $(IMAGE)
-	qemu-system-i386 -boot order=c -drive file=$(IMAGE),format=raw,if=ide,index=0
+	qemu-system-i386 -boot order=c -drive file=$(IMAGE),format=raw,if=ide,index=0 -display cocoa,zoom-to-fit=on

@@ -50,6 +50,28 @@ _start:
 		MOV		WORD [ES:0x502], 0
 		POP		ES
 
+		; Get 8x8 BIOS font pointer (INT 10h AX=1130h BH=03h)
+		MOV		AX, 0x1130
+		MOV		BH, 0x02
+		INT		0x10			; ES:BP = 8x14 font data
+		MOV		AX, ES
+		MOVZX	EAX, AX
+		SHL		EAX, 4
+		AND		EBP, 0xFFFF
+		ADD		EAX, EBP
+		PUSH	ES
+		XOR		BX, BX
+		MOV		ES, BX
+		MOV		[ES:0x4F8], EAX	; font pointer
+		POP		ES
+		MOV		AX, CS
+		MOV		ES, AX
+
+		; Set VESA mode 0x101 (640x480x256) banked at 0xA0000
+		MOV		AX, 0x4F02
+		MOV		BX, 0x0101		; no LFB — use banked window at 0xA0000
+		INT		0x10
+
 		; Disable interrupts before PMode
 		CLI
 
@@ -110,8 +132,10 @@ gdtr:
 		GLOBAL	start_32
 		GLOBAL	isr_timer
 		GLOBAL	isr_keyboard
+		GLOBAL	isr_mouse
 		EXTERN	timer_handler
 		EXTERN	keyboard_handler
+		EXTERN	mouse_handler
 
 start_32:
 		MOV		AX, 0x10
@@ -146,6 +170,15 @@ isr_keyboard:
 		PUSHAD
 		CALL	keyboard_handler
 		MOV		AL, 0x20
+		OUT		0x20, AL		; EOI to master PIC
+		POPAD
+		IRET
+
+isr_mouse:
+		PUSHAD
+		CALL	mouse_handler
+		MOV		AL, 0x20
+		OUT		0xA0, AL		; EOI to slave PIC
 		OUT		0x20, AL		; EOI to master PIC
 		POPAD
 		IRET

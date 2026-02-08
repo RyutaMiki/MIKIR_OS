@@ -1,377 +1,414 @@
 /*
- * chocola kernel (C)
+ * chocola kernel (C) — VGA graphics mode (320x200x256)
  * 32-bit protected mode, flat memory model.
- * VGA text mode 80x25 at 0xb8000.
  */
 
-#define VGA_COLS      80
-#define VGA_ROWS      25
-#define VGA_ATTR      0x0f   /* white on black */
+#define GFX_WIDTH     640
+#define GFX_HEIGHT    480
+#define CHAR_W        8
+#define CHAR_H        14
+#define CONSOLE_COLS  (GFX_WIDTH / CHAR_W)   /* 80 */
+#define CONSOLE_ROWS  32
+#define TASKBAR_Y     (CONSOLE_ROWS * CHAR_H) /* 448 */
+#define VGA_BANK_SIZE 65536                    /* 64KB per bank window */
+
+#define COL_BG        1    /* desktop blue */
+#define COL_FG        15   /* white */
+#define COL_TASKBAR   8    /* dark gray */
+#define COL_TBTEXT    14   /* yellow */
+#define COL_CURSOR    15   /* white */
+
 #define CMD_BUF_SIZE  64
 #define KBD_BUF_SIZE  32
 #define TIMER_HZ      100
 
-#define HEAP_START    0x200000   /* 2 MB */
-#define HEAP_SIZE     0x200000   /* 2 MB */
+#define HEAP_START    0x200000
+#define HEAP_SIZE     0x200000
 
-#define MAX_TASKS      4
+#define MAX_TASKS      8
 #define TASK_STACK_SIZE 4096
 
-#define FS_DIR_SECTOR 100    /* sector holding the file directory */
-#define FS_MAX_FILES  16     /* max entries in one sector (512/32) */
-#define FILE_BUF_SIZE 2048   /* max file size for write command */
+#define FS_DIR_SECTOR 100
+#define FS_MAX_FILES  16
+#define FILE_BUF_SIZE 2048
 
-static volatile unsigned short *const vga = (volatile unsigned short *)0xb8000;
+static const unsigned char *font;   /* 8x14 BIOS font (pointer at 0x4F8) */
 
 /* ---- I/O port helpers ---- */
 
 static inline unsigned char inb(unsigned short port)
-{
-	unsigned char val;
-	__asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"(port));
-	return val;
-}
+{ unsigned char v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
 
 static inline unsigned short inw(unsigned short port)
+{ unsigned short v; __asm__ volatile("inw %1,%0":"=a"(v):"Nd"(port)); return v; }
+
+static inline void outb(unsigned short port, unsigned char v)
+{ __asm__ volatile("outb %0,%1"::"a"(v),"Nd"(port)); }
+
+static inline void outw(unsigned short port, unsigned short v)
+{ __asm__ volatile("outw %0,%1"::"a"(v),"Nd"(port)); }
+
+static inline void io_wait(void) { outb(0x80, 0); }
+
+/* ---- VBE banked framebuffer (640x480 at 0xA0000, 64KB window) ---- */
+
+static unsigned char *const fb_win = (unsigned char *)0xA0000;
+static int cur_bank = -1;
+
+static void vbe_set_bank(int bank)
 {
-	unsigned short val;
-	__asm__ volatile ("inw %1, %0" : "=a"(val) : "Nd"(port));
-	return val;
+	if (bank == cur_bank) return;
+	cur_bank = bank;
+	/* Bochs VBE dispi interface — register 0x05 = BANK */
+	outw(0x1CE, 0x05);
+	outw(0x1CF, (unsigned short)bank);
 }
 
-static inline void outb(unsigned short port, unsigned char val)
+static void fb_write(unsigned offset, unsigned char val)
 {
-	__asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+	vbe_set_bank((int)(offset / VGA_BANK_SIZE));
+	fb_win[offset % VGA_BANK_SIZE] = val;
 }
 
-static inline void outw(unsigned short port, unsigned short val)
+static unsigned char fb_read(unsigned offset)
 {
-	__asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+	vbe_set_bank((int)(offset / VGA_BANK_SIZE));
+	return fb_win[offset % VGA_BANK_SIZE];
 }
 
-static inline void io_wait(void)
-{
-	outb(0x80, 0);
-}
-
-/* ---- Scan code set 1 -> ASCII (US layout, lowercase) ---- */
+/* ---- Scan code table ---- */
 
 static const char sc_to_ascii[128] = {
-	 0,  27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',  /* 00-0E */
-	'\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',      /* 0F-1C */
-	 0,  'a','s','d','f','g','h','j','k','l',';','\'','`',          /* 1D-29 */
-	 0,  '\\','z','x','c','v','b','n','m',',','.','/', 0,           /* 2A-36 */
-	'*', 0, ' '                                                      /* 37-39 */
+	 0,  27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
+	'\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
+	 0,  'a','s','d','f','g','h','j','k','l',';','\'','`',
+	 0,  '\\','z','x','c','v','b','n','m',',','.','/', 0,
+	'*', 0, ' '
 };
 
 /* ---- Keyboard ring buffer ---- */
 
-static volatile char    kbd_buf[KBD_BUF_SIZE];
-static volatile int     kbd_head, kbd_tail;
+static volatile char kbd_buf[KBD_BUF_SIZE];
+static volatile int  kbd_head, kbd_tail;
 
-/* ---- Timer tick counter ---- */
+/* ---- Timer ---- */
 
 static volatile unsigned int ticks;
 
-/* ---- Disk I/O buffer (shared, single-threaded) ---- */
+/* ---- Mouse state ---- */
+
+static volatile int mouse_x = 160, mouse_y = 100;
+static volatile unsigned char mouse_btns;
+
+/* ---- Disk / FS buffers ---- */
 
 static unsigned char disk_buf[512];
 static unsigned char file_buf[FILE_BUF_SIZE];
 
-/* ---- Simple filesystem directory entry (32 bytes) ---- */
-
 struct fs_entry {
-	char         name[20];    /* null-terminated filename */
-	unsigned int start;       /* start sector on disk */
-	unsigned int size;        /* file size in bytes */
-	unsigned int flags;       /* reserved */
+	char         name[20];
+	unsigned int start, size, flags;
 } __attribute__((packed));
 
-/* ---- VGA text mode ---- */
+/* ---- Graphics primitives ---- */
+
+static void gfx_pixel(int x, int y, unsigned char c)
+{
+	if ((unsigned)x < GFX_WIDTH && (unsigned)y < GFX_HEIGHT)
+		fb_write((unsigned)y * GFX_WIDTH + (unsigned)x, c);
+}
+
+static void gfx_rect(int x, int y, int w, int h, unsigned char c)
+{
+	int i, j, x2 = x + w, y2 = y + h;
+	if (x < 0) x = 0;  if (y < 0) y = 0;
+	if (x2 > GFX_WIDTH) x2 = GFX_WIDTH;
+	if (y2 > GFX_HEIGHT) y2 = GFX_HEIGHT;
+	for (j = y; j < y2; j++)
+		for (i = x; i < x2; i++)
+			fb_write((unsigned)j * GFX_WIDTH + (unsigned)i, c);
+}
+
+static void gfx_char(int x, int y, char ch, unsigned char fg, unsigned char bg)
+{
+	int row, col;
+	unsigned char bits;
+	unsigned base;
+	for (row = 0; row < CHAR_H; row++) {
+		bits = font[(unsigned char)ch * CHAR_H + row];
+		base = (unsigned)(y + row) * GFX_WIDTH + (unsigned)x;
+		for (col = 0; col < 8; col++)
+			fb_write(base + (unsigned)col, (bits & (0x80 >> col)) ? fg : bg);
+	}
+}
+
+static void gfx_text(int x, int y, const char *s, unsigned char fg, unsigned char bg)
+{
+	while (*s) { gfx_char(x, y, *s++, fg, bg); x += 8; }
+}
+
+/* ---- Console (character grid on framebuffer) ---- */
 
 static int cur_x, cur_y;
 
-static void vga_update_cursor(void)
-{
-	unsigned short pos = (unsigned short)(cur_y * VGA_COLS + cur_x);
-	outb(0x3D4, 14);
-	outb(0x3D5, (unsigned char)(pos >> 8));
-	outb(0x3D4, 15);
-	outb(0x3D5, (unsigned char)(pos & 0xFF));
-}
-
 static void vga_scroll(void)
 {
-	int i;
-	for (i = 0; i < VGA_COLS * (VGA_ROWS - 1); i++)
-		vga[i] = vga[i + VGA_COLS];
-	for (i = VGA_COLS * (VGA_ROWS - 1); i < VGA_COLS * VGA_ROWS; i++)
-		vga[i] = (VGA_ATTR << 8) | ' ';
-	cur_y = VGA_ROWS - 1;
+	unsigned i, total = (unsigned)GFX_WIDTH * (unsigned)(CONSOLE_ROWS - 1) * (unsigned)CHAR_H;
+	unsigned src_off = (unsigned)GFX_WIDTH * (unsigned)CHAR_H;
+	for (i = 0; i < total; i++)
+		fb_write(i, fb_read(i + src_off));
+	gfx_rect(0, (CONSOLE_ROWS - 1) * CHAR_H, GFX_WIDTH, CHAR_H, COL_BG);
+	cur_y = CONSOLE_ROWS - 1;
 }
 
 static void vga_putchar(char c)
 {
 	if (c == '\n') {
-		cur_x = 0;
-		cur_y++;
+		cur_x = 0; cur_y++;
 	} else if (c == '\b') {
-		if (cur_x > 0) {
-			cur_x--;
-			vga[cur_y * VGA_COLS + cur_x] = (VGA_ATTR << 8) | ' ';
-		}
+		if (cur_x > 0) { cur_x--; gfx_char(cur_x*CHAR_W, cur_y*CHAR_H, ' ', COL_FG, COL_BG); }
 	} else if (c == '\t') {
 		cur_x = (cur_x + 4) & ~3;
-		if (cur_x >= VGA_COLS) { cur_x = 0; cur_y++; }
+		if (cur_x >= CONSOLE_COLS) { cur_x = 0; cur_y++; }
 	} else {
-		vga[cur_y * VGA_COLS + cur_x] = (VGA_ATTR << 8) | (unsigned char)c;
+		gfx_char(cur_x*CHAR_W, cur_y*CHAR_H, c, COL_FG, COL_BG);
 		cur_x++;
-		if (cur_x >= VGA_COLS) { cur_x = 0; cur_y++; }
+		if (cur_x >= CONSOLE_COLS) { cur_x = 0; cur_y++; }
 	}
-	if (cur_y >= VGA_ROWS)
-		vga_scroll();
-	vga_update_cursor();
+	if (cur_y >= CONSOLE_ROWS) vga_scroll();
 }
 
-static void vga_puts(const char *s)
-{
-	while (*s)
-		vga_putchar(*s++);
-}
+static void vga_puts(const char *s) { while (*s) vga_putchar(*s++); }
 
 static void vga_putint(unsigned n)
 {
-	char buf[12];
-	int i = 0;
+	char buf[12]; int i = 0;
 	if (n == 0) { vga_putchar('0'); return; }
-	while (n > 0) {
-		buf[i++] = '0' + (n % 10);
-		n /= 10;
-	}
-	while (--i >= 0)
-		vga_putchar(buf[i]);
+	while (n) { buf[i++] = '0' + n % 10; n /= 10; }
+	while (--i >= 0) vga_putchar(buf[i]);
 }
 
 static void vga_puthex(unsigned n)
 {
-	static const char hex[] = "0123456789abcdef";
-	int i;
-	vga_puts("0x");
-	for (i = 28; i >= 0; i -= 4)
-		vga_putchar(hex[(n >> i) & 0xF]);
+	static const char h[] = "0123456789abcdef";
+	int i; vga_puts("0x");
+	for (i = 28; i >= 0; i -= 4) vga_putchar(h[(n >> i) & 0xF]);
 }
 
 static void vga_clear(void)
 {
-	int i;
-	for (i = 0; i < VGA_COLS * VGA_ROWS; i++)
-		vga[i] = (VGA_ATTR << 8) | ' ';
+	gfx_rect(0, 0, GFX_WIDTH, TASKBAR_Y, COL_BG);
 	cur_x = cur_y = 0;
-	vga_update_cursor();
 }
 
-/* ---- PIC (8259) initialization ---- */
+/* ---- Desktop (taskbar + palette) ---- */
+
+static void desktop_init(void)
+{
+	/* Custom palette */
+	outb(0x3C8, 1); outb(0x3C9, 0x08); outb(0x3C9, 0x10); outb(0x3C9, 0x28); /* blue bg */
+	outb(0x3C8, 8); outb(0x3C9, 0x12); outb(0x3C9, 0x12); outb(0x3C9, 0x12); /* taskbar gray */
+
+	/* Background */
+	gfx_rect(0, 0, GFX_WIDTH, TASKBAR_Y, COL_BG);
+	/* Taskbar */
+	gfx_rect(0, TASKBAR_Y, GFX_WIDTH, GFX_HEIGHT - TASKBAR_Y, COL_TASKBAR);
+	gfx_text(8, TASKBAR_Y + 9, "Chocola", COL_TBTEXT, COL_TASKBAR);
+}
+
+/* ---- PIC ---- */
 
 static void pic_init(void)
 {
-	outb(0x20, 0x11);  io_wait();
-	outb(0xA0, 0x11);  io_wait();
-	outb(0x21, 0x20);  io_wait();
-	outb(0xA1, 0x28);  io_wait();
-	outb(0x21, 0x04);  io_wait();
-	outb(0xA1, 0x02);  io_wait();
-	outb(0x21, 0x01);  io_wait();
-	outb(0xA1, 0x01);  io_wait();
-	outb(0x21, 0xFC);
-	outb(0xA1, 0xFF);
+	outb(0x20,0x11); io_wait(); outb(0xA0,0x11); io_wait();
+	outb(0x21,0x20); io_wait(); outb(0xA1,0x28); io_wait();
+	outb(0x21,0x04); io_wait(); outb(0xA1,0x02); io_wait();
+	outb(0x21,0x01); io_wait(); outb(0xA1,0x01); io_wait();
+	outb(0x21, 0xF8);   /* master: unmask IRQ0,1,2 */
+	outb(0xA1, 0xEF);   /* slave:  unmask IRQ12 (mouse) */
 }
 
-/* ---- PIT timer ---- */
+/* ---- PIT ---- */
 
 static void pit_init(unsigned hz)
 {
-	unsigned short div = (unsigned short)(1193182 / hz);
-	outb(0x43, 0x34);
-	outb(0x40, div & 0xFF);
-	outb(0x40, (div >> 8) & 0xFF);
+	unsigned short d = (unsigned short)(1193182 / hz);
+	outb(0x43,0x34); outb(0x40, d & 0xFF); outb(0x40, (d>>8) & 0xFF);
 }
 
-/* ---- IDT gate setter ---- */
+/* ---- IDT ---- */
 
-struct idt_entry {
-	unsigned short offset_low;
-	unsigned short selector;
-	unsigned char  zero;
-	unsigned char  type_attr;
-	unsigned short offset_high;
-} __attribute__((packed));
+struct idt_entry { unsigned short ol; unsigned short sel; unsigned char z, ta; unsigned short oh; } __attribute__((packed));
 
-static void idt_set_gate(int n, unsigned handler)
+static void idt_set_gate(int n, unsigned h)
 {
 	volatile struct idt_entry *idt = (volatile struct idt_entry *)0x70000;
-	idt[n].offset_low  = handler & 0xFFFF;
-	idt[n].selector    = 0x08;
-	idt[n].zero        = 0;
-	idt[n].type_attr   = 0x8E;
-	idt[n].offset_high = (handler >> 16) & 0xFFFF;
+	idt[n].ol = h & 0xFFFF; idt[n].sel = 0x08; idt[n].z = 0; idt[n].ta = 0x8E; idt[n].oh = (h>>16) & 0xFFFF;
 }
-
-/* ---- E820 memory map (filled by loader in real mode at linear 0x500) ---- */
-
-struct e820_entry {
-	unsigned int base_lo, base_hi;
-	unsigned int len_lo, len_hi;
-	unsigned int type;
-	unsigned int acpi;
-} __attribute__((packed));
 
 /* ---- Heap allocator ---- */
 
-struct heap_block {
-	unsigned int size;
-	unsigned int used;
-	struct heap_block *next;
-};
-
+struct heap_block { unsigned int size, used; struct heap_block *next; };
 static struct heap_block *heap_head;
 
 static void heap_init(void)
 {
 	heap_head = (struct heap_block *)HEAP_START;
 	heap_head->size = HEAP_SIZE - sizeof(struct heap_block);
-	heap_head->used = 0;
-	heap_head->next = 0;
+	heap_head->used = 0; heap_head->next = 0;
 }
 
-static void *kmalloc(unsigned size)
+static void *kmalloc(unsigned sz)
 {
-	struct heap_block *block, *nb;
-
-	size = (size + 3) & ~3;   /* align to 4 bytes */
-
-	for (block = heap_head; block; block = block->next) {
-		if (!block->used && block->size >= size) {
-			/* split if enough room for another block */
-			if (block->size > size + sizeof(struct heap_block) + 4) {
-				nb = (struct heap_block *)((unsigned char *)block
-				      + sizeof(struct heap_block) + size);
-				nb->size = block->size - size - sizeof(struct heap_block);
-				nb->used = 0;
-				nb->next = block->next;
-				block->size = size;
-				block->next = nb;
+	struct heap_block *b, *nb;
+	sz = (sz + 3) & ~3;
+	for (b = heap_head; b; b = b->next) {
+		if (!b->used && b->size >= sz) {
+			if (b->size > sz + sizeof(struct heap_block) + 4) {
+				nb = (struct heap_block *)((unsigned char *)b + sizeof(struct heap_block) + sz);
+				nb->size = b->size - sz - sizeof(struct heap_block);
+				nb->used = 0; nb->next = b->next;
+				b->size = sz; b->next = nb;
 			}
-			block->used = 1;
-			return (void *)((unsigned char *)block + sizeof(struct heap_block));
+			b->used = 1;
+			return (void *)((unsigned char *)b + sizeof(struct heap_block));
 		}
 	}
-	return 0;   /* out of memory */
+	return 0;
 }
 
-static void kfree(void *ptr)
+static void kfree(void *p)
 {
-	struct heap_block *block;
-	if (!ptr) return;
-	block = (struct heap_block *)((unsigned char *)ptr - sizeof(struct heap_block));
-	block->used = 0;
-
-	/* coalesce with next free block(s) */
-	while (block->next && !block->next->used) {
-		block->size += sizeof(struct heap_block) + block->next->size;
-		block->next = block->next->next;
+	struct heap_block *b;
+	if (!p) return;
+	b = (struct heap_block *)((unsigned char *)p - sizeof(struct heap_block));
+	b->used = 0;
+	while (b->next && !b->next->used) {
+		b->size += sizeof(struct heap_block) + b->next->size;
+		b->next = b->next->next;
 	}
 }
 
-/* ---- Task management (preemptive multitasking) ---- */
+/* ---- Task management ---- */
 
-struct task {
-	unsigned esp;
-	int      active;
-	char     name[16];
-};
-
+struct task { unsigned esp; int active; char name[16]; };
 static struct task tasks[MAX_TASKS];
-static int current_task;
-static int num_tasks;
+static int current_task, num_tasks;
 
-static void my_strcpy(char *dst, const char *src)
-{
-	while (*src) *dst++ = *src++;
-	*dst = 0;
-}
+static void my_strcpy(char *d, const char *s) { while (*s) *d++ = *s++; *d = 0; }
 
-static void task_exit(void)
-{
-	tasks[current_task].active = 0;
-	for (;;) __asm__ volatile ("hlt");
-}
+static void task_exit(void) { tasks[current_task].active = 0; for(;;) __asm__ volatile("hlt"); }
 
 static void task_init_main(void)
 {
 	my_strcpy(tasks[0].name, "shell");
-	tasks[0].active = 1;
-	tasks[0].esp    = 0;   /* will be saved on first context switch */
-	current_task = 0;
-	num_tasks    = 1;
+	tasks[0].active = 1; tasks[0].esp = 0;
+	current_task = 0; num_tasks = 1;
 }
 
-static int task_create(void (*func)(void), const char *name)
+static int task_create(void (*fn)(void), const char *name)
 {
-	unsigned *sp;
-	int id;
-
+	unsigned *sp; int id;
 	if (num_tasks >= MAX_TASKS) return -1;
-
 	id = num_tasks;
 	sp = (unsigned *)((unsigned char *)kmalloc(TASK_STACK_SIZE) + TASK_STACK_SIZE);
-
-	/* fake stack: when POPAD + IRET execute, the task starts at func() */
-	*(--sp) = (unsigned)task_exit;   /* return addr when func() returns */
-	*(--sp) = 0x202;                /* EFLAGS  (IF=1) */
-	*(--sp) = 0x08;                 /* CS */
-	*(--sp) = (unsigned)func;       /* EIP */
-	*(--sp) = 0;  /* EAX */
-	*(--sp) = 0;  /* ECX */
-	*(--sp) = 0;  /* EDX */
-	*(--sp) = 0;  /* EBX */
-	*(--sp) = 0;  /* ESP (ignored by POPAD) */
-	*(--sp) = 0;  /* EBP */
-	*(--sp) = 0;  /* ESI */
-	*(--sp) = 0;  /* EDI */
-
-	tasks[id].esp    = (unsigned)sp;
+	*(--sp) = (unsigned)task_exit;
+	*(--sp) = 0x202; *(--sp) = 0x08; *(--sp) = (unsigned)fn;
+	*(--sp)=0; *(--sp)=0; *(--sp)=0; *(--sp)=0;
+	*(--sp)=0; *(--sp)=0; *(--sp)=0; *(--sp)=0;
+	tasks[id].esp = (unsigned)sp;
 	tasks[id].active = 1;
 	my_strcpy(tasks[id].name, name);
 	num_tasks++;
 	return id;
 }
 
-/* Background task: clock display in the top-right corner */
-static void task_clock(void)
+/* ---- Mouse cursor (10x14 arrow) ---- */
+
+#define CUR_W 10
+#define CUR_H 14
+
+/* 1=white pixel, 2=black outline */
+static const unsigned char cursor_data[CUR_H][CUR_W] = {
+	{2,0,0,0,0,0,0,0,0,0},
+	{2,2,0,0,0,0,0,0,0,0},
+	{2,1,2,0,0,0,0,0,0,0},
+	{2,1,1,2,0,0,0,0,0,0},
+	{2,1,1,1,2,0,0,0,0,0},
+	{2,1,1,1,1,2,0,0,0,0},
+	{2,1,1,1,1,1,2,0,0,0},
+	{2,1,1,1,1,1,1,2,0,0},
+	{2,1,1,1,1,1,1,1,2,0},
+	{2,1,1,1,1,2,2,2,2,0},
+	{2,1,1,2,1,2,0,0,0,0},
+	{2,1,2,0,2,1,2,0,0,0},
+	{2,2,0,0,2,1,2,0,0,0},
+	{2,0,0,0,0,2,2,0,0,0},
+};
+
+static unsigned char cursor_save[CUR_W * CUR_H];
+
+static void cursor_hide(int cx, int cy)
+{
+	int r, c, idx = 0;
+	unsigned off;
+	for (r = 0; r < CUR_H; r++)
+		for (c = 0; c < CUR_W; c++, idx++)
+			if (cursor_data[r][c] && (unsigned)(cx+c) < GFX_WIDTH && (unsigned)(cy+r) < GFX_HEIGHT) {
+				off = (unsigned)(cy+r)*GFX_WIDTH + (unsigned)(cx+c);
+				fb_write(off, cursor_save[idx]);
+			}
+}
+
+static void cursor_show(int cx, int cy)
+{
+	int r, c, idx = 0;
+	unsigned off;
+	for (r = 0; r < CUR_H; r++)
+		for (c = 0; c < CUR_W; c++, idx++) {
+			if ((unsigned)(cx+c) >= GFX_WIDTH || (unsigned)(cy+r) >= GFX_HEIGHT) continue;
+			off = (unsigned)(cy+r)*GFX_WIDTH + (unsigned)(cx+c);
+			cursor_save[idx] = fb_read(off);
+			if (cursor_data[r][c] == 2)
+				fb_write(off, 0);
+			else if (cursor_data[r][c] == 1)
+				fb_write(off, 15);
+		}
+}
+
+/* GUI background task: taskbar clock + mouse cursor */
+static void task_gui(void)
 {
 	unsigned last_sec = 0xFFFFFFFF;
+	int old_mx = -1, old_my = -1;
+
 	for (;;) {
+		/* Update clock on taskbar */
 		unsigned t = ticks;
 		unsigned sec = t / TIMER_HZ;
 		if (sec != last_sec) {
-			unsigned min, hr;
-			volatile unsigned short *v = (volatile unsigned short *)0xb8000;
-			int col = VGA_COLS - 8;
+			unsigned min = sec / 60, hr = min / 60;
+			char tb[9];
+			sec %= 60; min %= 60;
+			tb[0] = '0'+hr/10; tb[1] = '0'+hr%10; tb[2] = ':';
+			tb[3] = '0'+min/10; tb[4] = '0'+min%10; tb[5] = ':';
+			tb[6] = '0'+sec/10; tb[7] = '0'+sec%10; tb[8] = 0;
+			gfx_text(GFX_WIDTH - 72, TASKBAR_Y + 9, tb, COL_TBTEXT, COL_TASKBAR);
 			last_sec = sec;
-			min = sec / 60;
-			hr  = min / 60;
-			sec %= 60;
-			min %= 60;
-			v[col+0] = 0x0e00 | ('0' + hr/10);
-			v[col+1] = 0x0e00 | ('0' + hr%10);
-			v[col+2] = 0x0e00 | ':';
-			v[col+3] = 0x0e00 | ('0' + min/10);
-			v[col+4] = 0x0e00 | ('0' + min%10);
-			v[col+5] = 0x0e00 | ':';
-			v[col+6] = 0x0e00 | ('0' + sec/10);
-			v[col+7] = 0x0e00 | ('0' + sec%10);
 		}
-		__asm__ volatile ("hlt");
+
+		/* Mouse cursor — only move when position changes, atomic to avoid flicker */
+		{
+			int mx = mouse_x, my = mouse_y;
+			if (mx != old_mx || my != old_my) {
+				__asm__ volatile("cli");
+				if (old_mx >= 0) cursor_hide(old_mx, old_my);
+				cursor_show(mx, my);
+				old_mx = mx; old_my = my;
+				__asm__ volatile("sti");
+			}
+		}
+		__asm__ volatile("hlt");
 	}
 }
 
@@ -379,22 +416,16 @@ static void task_clock(void)
 
 extern void isr_timer(void);
 extern void isr_keyboard(void);
+extern void isr_mouse(void);
 
 unsigned timer_handler(unsigned esp)
 {
 	int next;
 	ticks++;
-
 	if (num_tasks <= 1) return esp;
-
 	tasks[current_task].esp = esp;
-
-	/* round-robin: find next active task */
 	next = current_task;
-	do {
-		next = (next + 1) % num_tasks;
-	} while (!tasks[next].active && next != current_task);
-
+	do { next = (next+1) % num_tasks; } while (!tasks[next].active && next != current_task);
 	current_task = next;
 	return tasks[current_task].esp;
 }
@@ -403,505 +434,292 @@ void keyboard_handler(void)
 {
 	unsigned char sc = inb(0x60);
 	int next;
-	if (sc & 0x80)
-		return;
+	if (sc & 0x80) return;
 	if (sc < sizeof(sc_to_ascii) && sc_to_ascii[sc]) {
-		next = (kbd_head + 1) % KBD_BUF_SIZE;
-		if (next != kbd_tail) {
-			kbd_buf[kbd_head] = sc_to_ascii[sc];
-			kbd_head = next;
-		}
+		next = (kbd_head+1) % KBD_BUF_SIZE;
+		if (next != kbd_tail) { kbd_buf[kbd_head] = sc_to_ascii[sc]; kbd_head = next; }
 	}
 }
 
-/* ---- Keyboard (interrupt-driven) ---- */
+void mouse_handler(void)
+{
+	static int cycle = 0;
+	static unsigned char bytes[3];
+	int dx, dy;
+
+	/* Only read if data is from auxiliary device (mouse, not keyboard) */
+	if (!(inb(0x64) & 0x20)) { inb(0x60); return; }
+
+	bytes[cycle] = inb(0x60);
+
+	/* Byte 0 must have bit 3 set (PS/2 always-1 bit); resync if not */
+	if (cycle == 0 && !(bytes[0] & 0x08)) return;
+
+	cycle++;
+	if (cycle < 3) return;
+	cycle = 0;
+
+	mouse_btns = bytes[0] & 7;
+	dx = bytes[1]; dy = bytes[2];
+	if (bytes[0] & 0x10) dx -= 256;
+	if (bytes[0] & 0x20) dy -= 256;
+	mouse_x += dx; mouse_y -= dy;
+	if (mouse_x < 0) mouse_x = 0;
+	if (mouse_x > GFX_WIDTH - CUR_W) mouse_x = GFX_WIDTH - CUR_W;
+	if (mouse_y < 0) mouse_y = 0;
+	if (mouse_y > TASKBAR_Y - 1) mouse_y = TASKBAR_Y - 1;
+}
+
+/* ---- Keyboard ---- */
 
 static char kbd_getchar(void)
 {
 	char c;
-	while (kbd_head == kbd_tail)
-		__asm__ volatile ("hlt");
-	c = kbd_buf[kbd_tail];
-	kbd_tail = (kbd_tail + 1) % KBD_BUF_SIZE;
+	while (kbd_head == kbd_tail) __asm__ volatile("hlt");
+	c = kbd_buf[kbd_tail]; kbd_tail = (kbd_tail+1) % KBD_BUF_SIZE;
 	return c;
 }
 
-/* ---- ATA PIO disk read ---- */
+/* ---- ATA PIO ---- */
 
 static void ata_read_sector(unsigned lba, void *buf)
 {
-	int i;
-	unsigned short *p = (unsigned short *)buf;
-
-	/* Wait for BSY clear */
-	while (inb(0x1F7) & 0x80)
-		;
-
-	outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));   /* drive 0, LBA mode */
-	outb(0x1F2, 1);                                /* 1 sector */
-	outb(0x1F3, lba & 0xFF);                       /* LBA low */
-	outb(0x1F4, (lba >> 8) & 0xFF);                /* LBA mid */
-	outb(0x1F5, (lba >> 16) & 0xFF);               /* LBA high */
-	outb(0x1F7, 0x20);                             /* READ SECTORS */
-
-	/* Wait for DRQ */
-	while (!(inb(0x1F7) & 0x08))
-		;
-
-	/* Read 256 words = 512 bytes */
-	for (i = 0; i < 256; i++)
-		p[i] = inw(0x1F0);
+	int i; unsigned short *p = (unsigned short *)buf;
+	while (inb(0x1F7) & 0x80);
+	outb(0x1F6, 0xE0|((lba>>24)&0xF));
+	outb(0x1F2,1); outb(0x1F3,lba&0xFF); outb(0x1F4,(lba>>8)&0xFF); outb(0x1F5,(lba>>16)&0xFF);
+	outb(0x1F7,0x20);
+	while (!(inb(0x1F7) & 0x08));
+	for (i=0;i<256;i++) p[i]=inw(0x1F0);
 }
-
-/* ---- ATA PIO disk write ---- */
 
 static void ata_write_sector(unsigned lba, const void *buf)
 {
-	int i;
-	const unsigned short *p = (const unsigned short *)buf;
-
-	while (inb(0x1F7) & 0x80)
-		;
-
-	outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-	outb(0x1F2, 1);
-	outb(0x1F3, lba & 0xFF);
-	outb(0x1F4, (lba >> 8) & 0xFF);
-	outb(0x1F5, (lba >> 16) & 0xFF);
-	outb(0x1F7, 0x30);                             /* WRITE SECTORS */
-
-	while (!(inb(0x1F7) & 0x08))
-		;
-
-	for (i = 0; i < 256; i++)
-		outw(0x1F0, p[i]);
-
-	/* Cache flush */
-	outb(0x1F7, 0xE7);
-	while (inb(0x1F7) & 0x80)
-		;
+	int i; const unsigned short *p = (const unsigned short *)buf;
+	while (inb(0x1F7)&0x80);
+	outb(0x1F6,0xE0|((lba>>24)&0xF));
+	outb(0x1F2,1); outb(0x1F3,lba&0xFF); outb(0x1F4,(lba>>8)&0xFF); outb(0x1F5,(lba>>16)&0xFF);
+	outb(0x1F7,0x30);
+	while (!(inb(0x1F7)&0x08));
+	for (i=0;i<256;i++) outw(0x1F0,p[i]);
+	outb(0x1F7,0xE7); while (inb(0x1F7)&0x80);
 }
 
 /* ---- String helpers ---- */
 
 static int my_strcmp(const char *a, const char *b)
-{
-	while (*a && *a == *b) { a++; b++; }
-	return (unsigned char)*a - (unsigned char)*b;
-}
+{ while (*a && *a==*b){a++;b++;} return (unsigned char)*a-(unsigned char)*b; }
 
-static int starts_with(const char *s, const char *prefix)
+static int starts_with(const char *s, const char *p)
+{ while(*p){if(*s++!=*p++)return 0;} return 1; }
+
+/* ---- PS/2 mouse init ---- */
+
+static void mouse_wait_in(void)  { int i; for(i=0;i<100000;i++) if(!(inb(0x64)&2)) return; }
+static void mouse_wait_out(void) { int i; for(i=0;i<100000;i++) if(inb(0x64)&1) return; }
+
+static void mouse_init(void)
 {
-	while (*prefix) {
-		if (*s++ != *prefix++)
-			return 0;
-	}
-	return 1;
+	unsigned char st;
+
+	/* Flush any stale data in the controller buffer */
+	while (inb(0x64) & 1) inb(0x60);
+
+	mouse_wait_in(); outb(0x64, 0xA8);
+	mouse_wait_in(); outb(0x64, 0x20);
+	mouse_wait_out(); st = inb(0x60);
+	st |= 2;
+	mouse_wait_in(); outb(0x64, 0x60);
+	mouse_wait_in(); outb(0x60, st);
+	mouse_wait_in(); outb(0x64, 0xD4);
+	mouse_wait_in(); outb(0x60, 0xF6);
+	mouse_wait_out(); inb(0x60);
+	mouse_wait_in(); outb(0x64, 0xD4);
+	mouse_wait_in(); outb(0x60, 0xF4);
+	mouse_wait_out(); inb(0x60);
 }
 
 /* ---- Filesystem commands ---- */
 
 static void cmd_dir(void)
 {
-	struct fs_entry *entries;
-	int i, count;
-
+	struct fs_entry *e; int i, count = 0;
 	ata_read_sector(FS_DIR_SECTOR, disk_buf);
-	entries = (struct fs_entry *)disk_buf;
-
-	count = 0;
+	e = (struct fs_entry *)disk_buf;
 	for (i = 0; i < FS_MAX_FILES; i++) {
-		if (entries[i].name[0] == '\0')
-			break;
-		vga_puts("  ");
-		vga_puts(entries[i].name);
-		/* pad to column 24 */
-		{
-			int len = 0;
-			const char *p = entries[i].name;
-			while (*p++) len++;
-			while (len++ < 20) vga_putchar(' ');
-		}
-		vga_putint(entries[i].size);
-		vga_puts(" bytes\n");
-		count++;
+		if (!e[i].name[0]) break;
+		vga_puts("  "); vga_puts(e[i].name);
+		{ int l=0; const char *p=e[i].name; while(*p++)l++; while(l++<20) vga_putchar(' '); }
+		vga_putint(e[i].size); vga_puts(" bytes\n"); count++;
 	}
-	if (count == 0)
-		vga_puts("  (no files)\n");
-	vga_putint(count);
-	vga_puts(" file(s)\n");
+	if (!count) vga_puts("  (no files)\n");
+	vga_putint((unsigned)count); vga_puts(" file(s)\n");
 }
 
-static void cmd_type(const char *filename)
+static void cmd_type(const char *fn)
 {
-	struct fs_entry *entries;
-	int i;
-	unsigned remaining, sector, to_print, j;
-
-	ata_read_sector(FS_DIR_SECTOR, disk_buf);
-	entries = (struct fs_entry *)disk_buf;
-
-	for (i = 0; i < FS_MAX_FILES; i++) {
-		if (entries[i].name[0] == '\0')
-			break;
-		if (my_strcmp(entries[i].name, filename) == 0) {
-			remaining = entries[i].size;
-			sector = entries[i].start;
-			while (remaining > 0) {
-				ata_read_sector(sector, disk_buf);
-				to_print = remaining > 512 ? 512 : remaining;
-				for (j = 0; j < to_print; j++)
-					vga_putchar((char)disk_buf[j]);
-				remaining -= to_print;
-				sector++;
-			}
+	struct fs_entry *e; int i; unsigned rem, sec, tp, j;
+	ata_read_sector(FS_DIR_SECTOR, disk_buf); e = (struct fs_entry *)disk_buf;
+	for (i=0;i<FS_MAX_FILES;i++) {
+		if (!e[i].name[0]) break;
+		if (my_strcmp(e[i].name,fn)==0) {
+			rem=e[i].size; sec=e[i].start;
+			while (rem) { ata_read_sector(sec,disk_buf); tp=rem>512?512:rem;
+				for(j=0;j<tp;j++) vga_putchar((char)disk_buf[j]); rem-=tp; sec++; }
 			return;
 		}
 	}
-	vga_puts("File not found: ");
-	vga_puts(filename);
-	vga_putchar('\n');
+	vga_puts("File not found: "); vga_puts(fn); vga_putchar('\n');
 }
 
-/* ---- File write / delete commands ---- */
-
-static void cmd_write(const char *filename)
+static void cmd_write(const char *fn)
 {
-	struct fs_entry *entries;
-	int buf_pos, line_start, slot, i, j;
-	unsigned free_sector, end, sectors_needed;
-	char c;
-
-	/* Read directory: find free slot, check duplicates, find free sector */
-	ata_read_sector(FS_DIR_SECTOR, disk_buf);
-	entries = (struct fs_entry *)disk_buf;
-
-	slot = -1;
-	free_sector = 110;   /* data area starts at sector 110 */
-
-	for (i = 0; i < FS_MAX_FILES; i++) {
-		if (entries[i].name[0] == '\0') {
-			if (slot < 0) slot = i;
-			continue;
-		}
-		if (my_strcmp(entries[i].name, filename) == 0) {
-			vga_puts("File exists. Use 'del' first.\n");
-			return;
-		}
-		end = entries[i].start + (entries[i].size + 511) / 512;
-		if (end > free_sector)
-			free_sector = end;
+	struct fs_entry *e; int bp=0,ls,sl=-1,i,j; unsigned fs=110,end,sn; char c;
+	ata_read_sector(FS_DIR_SECTOR,disk_buf); e=(struct fs_entry*)disk_buf;
+	for(i=0;i<FS_MAX_FILES;i++){
+		if(!e[i].name[0]){if(sl<0)sl=i;continue;}
+		if(my_strcmp(e[i].name,fn)==0){vga_puts("File exists. Use 'del' first.\n");return;}
+		end=e[i].start+(e[i].size+511)/512; if(end>fs)fs=end;
 	}
-
-	if (slot < 0) {
-		vga_puts("Directory full.\n");
-		return;
-	}
-
-	/* Prompt user for text input */
+	if(sl<0){vga_puts("Directory full.\n");return;}
 	vga_puts("Enter text (blank line to save):\n");
-	buf_pos = 0;
-
-	for (;;) {
-		vga_puts("> ");
-		line_start = buf_pos;
-
-		for (;;) {
-			c = kbd_getchar();
-			if (c == '\n') {
-				vga_putchar('\n');
-				break;
-			} else if (c == '\b') {
-				if (buf_pos > line_start) {
-					buf_pos--;
-					vga_putchar('\b');
-				}
-			} else if (buf_pos < FILE_BUF_SIZE - 2) {
-				file_buf[buf_pos++] = (unsigned char)c;
-				vga_putchar(c);
-			}
-		}
-
-		if (buf_pos == line_start)
-			break;
-		if (buf_pos < FILE_BUF_SIZE - 1)
-			file_buf[buf_pos++] = '\n';
+	for(;;){
+		vga_puts("> "); ls=bp;
+		for(;;){c=kbd_getchar();if(c=='\n'){vga_putchar('\n');break;}
+			else if(c=='\b'){if(bp>ls){bp--;vga_putchar('\b');}}
+			else if(bp<FILE_BUF_SIZE-2){file_buf[bp++]=(unsigned char)c;vga_putchar(c);}}
+		if(bp==ls)break; if(bp<FILE_BUF_SIZE-1)file_buf[bp++]='\n';
 	}
-
-	if (buf_pos == 0) {
-		vga_puts("Empty file, not saved.\n");
-		return;
-	}
-
-	/* Write file data to disk, sector by sector */
-	sectors_needed = ((unsigned)buf_pos + 511) / 512;
-	for (i = 0; i < (int)sectors_needed; i++) {
-		int offset = i * 512;
-		int to_copy = buf_pos - offset;
-		if (to_copy > 512) to_copy = 512;
-		for (j = 0; j < 512; j++)
-			disk_buf[j] = (j < to_copy) ? file_buf[offset + j] : 0;
-		ata_write_sector(free_sector + (unsigned)i, disk_buf);
-	}
-
-	/* Update directory on disk */
-	ata_read_sector(FS_DIR_SECTOR, disk_buf);
-	entries = (struct fs_entry *)disk_buf;
-	for (j = 0; j < 20; j++)
-		entries[slot].name[j] = 0;
-	for (j = 0; filename[j] && j < 19; j++)
-		entries[slot].name[j] = filename[j];
-	entries[slot].start = free_sector;
-	entries[slot].size  = (unsigned)buf_pos;
-	entries[slot].flags = 0;
-	ata_write_sector(FS_DIR_SECTOR, disk_buf);
-
-	vga_puts("Saved: ");
-	vga_puts(filename);
-	vga_puts(" (");
-	vga_putint((unsigned)buf_pos);
-	vga_puts(" bytes)\n");
+	if(!bp){vga_puts("Empty file, not saved.\n");return;}
+	sn=((unsigned)bp+511)/512;
+	for(i=0;i<(int)sn;i++){int o=i*512,tc=bp-o;if(tc>512)tc=512;
+		for(j=0;j<512;j++)disk_buf[j]=(j<tc)?file_buf[o+j]:0;
+		ata_write_sector(fs+(unsigned)i,disk_buf);}
+	ata_read_sector(FS_DIR_SECTOR,disk_buf);e=(struct fs_entry*)disk_buf;
+	for(j=0;j<20;j++)e[sl].name[j]=0;
+	for(j=0;fn[j]&&j<19;j++)e[sl].name[j]=fn[j];
+	e[sl].start=fs;e[sl].size=(unsigned)bp;e[sl].flags=0;
+	ata_write_sector(FS_DIR_SECTOR,disk_buf);
+	vga_puts("Saved: ");vga_puts(fn);vga_puts(" (");vga_putint((unsigned)bp);vga_puts(" bytes)\n");
 }
 
-static void cmd_del(const char *filename)
+static void cmd_del(const char *fn)
 {
-	struct fs_entry *entries;
-	int i, j;
-
-	ata_read_sector(FS_DIR_SECTOR, disk_buf);
-	entries = (struct fs_entry *)disk_buf;
-
-	for (i = 0; i < FS_MAX_FILES; i++) {
-		if (entries[i].name[0] == '\0')
-			continue;
-		if (my_strcmp(entries[i].name, filename) == 0) {
-			for (j = 0; j < 32; j++)
-				((unsigned char *)&entries[i])[j] = 0;
-			ata_write_sector(FS_DIR_SECTOR, disk_buf);
-			vga_puts("Deleted: ");
-			vga_puts(filename);
-			vga_putchar('\n');
-			return;
+	struct fs_entry *e; int i,j;
+	ata_read_sector(FS_DIR_SECTOR,disk_buf);e=(struct fs_entry*)disk_buf;
+	for(i=0;i<FS_MAX_FILES;i++){
+		if(!e[i].name[0])continue;
+		if(my_strcmp(e[i].name,fn)==0){
+			for(j=0;j<32;j++)((unsigned char*)&e[i])[j]=0;
+			ata_write_sector(FS_DIR_SECTOR,disk_buf);
+			vga_puts("Deleted: ");vga_puts(fn);vga_putchar('\n');return;
 		}
 	}
-
-	vga_puts("File not found: ");
-	vga_puts(filename);
-	vga_putchar('\n');
+	vga_puts("File not found: ");vga_puts(fn);vga_putchar('\n');
 }
 
 /* ---- Task commands ---- */
 
 static void cmd_ps(void)
 {
-	int i, len;
-	const char *p;
+	int i,l; const char *p;
 	vga_puts("  ID  Name         Status\n");
-	for (i = 0; i < num_tasks; i++) {
-		vga_puts("  ");
-		vga_putint((unsigned)i);
-		vga_puts("   ");
-		vga_puts(tasks[i].name);
-		len = 0; p = tasks[i].name;
-		while (*p++) len++;
-		while (len++ < 13) vga_putchar(' ');
-		if (i == current_task)      vga_puts("running\n");
-		else if (tasks[i].active)   vga_puts("ready\n");
-		else                        vga_puts("stopped\n");
+	for(i=0;i<num_tasks;i++){
+		vga_puts("  ");vga_putint((unsigned)i);vga_puts("   ");vga_puts(tasks[i].name);
+		l=0;p=tasks[i].name;while(*p++)l++;while(l++<13)vga_putchar(' ');
+		if(i==current_task)vga_puts("running\n");
+		else if(tasks[i].active)vga_puts("ready\n");
+		else vga_puts("stopped\n");
 	}
 }
 
 /* ---- Memory commands ---- */
 
+struct e820_entry { unsigned int blo,bhi,llo,lhi,type,acpi; } __attribute__((packed));
+
 static void cmd_mem(void)
 {
-	unsigned short e820_count = *(volatile unsigned short *)0x500;
-	struct e820_entry *e = (struct e820_entry *)0x504;
-	unsigned total_kb = 0;
-	struct heap_block *block;
-	unsigned heap_used = 0, heap_free = 0;
-	int i;
-
+	unsigned short e820n=*(volatile unsigned short*)0x500;
+	struct e820_entry *e=(struct e820_entry*)0x504;
+	unsigned tkb=0; struct heap_block *b; unsigned hu=0,hf=0; int i;
 	vga_puts("Memory Map (E820):\n");
-	for (i = 0; i < e820_count && i < 20; i++) {
-		vga_puts("  ");
-		vga_puthex(e[i].base_lo);
-		vga_puts(" - ");
-		vga_puthex(e[i].base_lo + e[i].len_lo);
-		switch (e[i].type) {
-		case 1:  vga_puts(" usable");   total_kb += e[i].len_lo / 1024; break;
-		case 2:  vga_puts(" reserved"); break;
-		case 3:  vga_puts(" ACPI");     break;
-		default: vga_puts(" other");    break;
-		}
+	for(i=0;i<e820n&&i<20;i++){
+		vga_puts("  ");vga_puthex(e[i].blo);vga_puts(" - ");vga_puthex(e[i].blo+e[i].llo);
+		switch(e[i].type){case 1:vga_puts(" usable");tkb+=e[i].llo/1024;break;
+			case 2:vga_puts(" reserved");break;default:vga_puts(" other");break;}
 		vga_putchar('\n');
 	}
-	if (e820_count == 0)
-		vga_puts("  (not available)\n");
-
-	vga_puts("Total usable: ");
-	vga_putint(total_kb);
-	vga_puts(" KB (");
-	vga_putint(total_kb / 1024);
-	vga_puts(" MB)\n\n");
-
-	vga_puts("Heap (2 MB at 0x200000):\n");
-	for (block = heap_head; block; block = block->next) {
-		if (block->used) heap_used += block->size;
-		else             heap_free += block->size;
-	}
-	vga_puts("  Used: ");  vga_putint(heap_used);  vga_puts(" bytes\n");
-	vga_puts("  Free: ");  vga_putint(heap_free);  vga_puts(" bytes\n");
+	if(!e820n)vga_puts("  (not available)\n");
+	vga_puts("Total: ");vga_putint(tkb);vga_puts(" KB (");vga_putint(tkb/1024);vga_puts(" MB)\n\n");
+	vga_puts("Heap:\n");
+	for(b=heap_head;b;b=b->next){if(b->used)hu+=b->size;else hf+=b->size;}
+	vga_puts("  Used: ");vga_putint(hu);vga_puts("  Free: ");vga_putint(hf);vga_putchar('\n');
 }
 
 static void cmd_memtest(void)
 {
-	void *a, *b, *c;
-
-	vga_puts("malloc(100)... ");
-	a = kmalloc(100);
-	if (a) { vga_puts("OK at "); vga_puthex((unsigned)a); vga_putchar('\n'); }
-	else   { vga_puts("FAIL\n"); return; }
-
-	vga_puts("malloc(200)... ");
-	b = kmalloc(200);
-	if (b) { vga_puts("OK at "); vga_puthex((unsigned)b); vga_putchar('\n'); }
-	else   { vga_puts("FAIL\n"); return; }
-
-	vga_puts("free(first)... ");
-	kfree(a);
-	vga_puts("OK\n");
-
-	vga_puts("malloc(50)...  ");
-	c = kmalloc(50);
-	if (c) {
-		vga_puts("OK at "); vga_puthex((unsigned)c);
-		if (c == a) vga_puts(" (reused!)");
-		vga_putchar('\n');
-	} else { vga_puts("FAIL\n"); return; }
-
-	kfree(b);
-	kfree(c);
-	vga_puts("All tests passed.\n");
+	void *a,*b,*c;
+	vga_puts("malloc(100)... ");a=kmalloc(100);
+	if(a){vga_puts("OK ");vga_puthex((unsigned)a);vga_putchar('\n');}else{vga_puts("FAIL\n");return;}
+	vga_puts("malloc(200)... ");b=kmalloc(200);
+	if(b){vga_puts("OK ");vga_puthex((unsigned)b);vga_putchar('\n');}else{vga_puts("FAIL\n");return;}
+	vga_puts("free(first)... ");kfree(a);vga_puts("OK\n");
+	vga_puts("malloc(50)...  ");c=kmalloc(50);
+	if(c){vga_puts("OK ");vga_puthex((unsigned)c);if(c==a)vga_puts(" (reused!)");vga_putchar('\n');}
+	else{vga_puts("FAIL\n");return;}
+	kfree(b);kfree(c);vga_puts("All tests passed.\n");
 }
 
 /* ---- Shell ---- */
 
-static void print_prompt(void)
-{
-	vga_puts("C:\\>");
-}
+static void print_prompt(void) { vga_puts("C:\\>"); }
 
 static void shell_exec(char *cmd)
 {
-	while (*cmd == ' ') cmd++;
-
-	if (cmd[0] == '\0') {
-		/* empty */
-	} else if (my_strcmp(cmd, "help") == 0) {
+	while(*cmd==' ')cmd++;
+	if(!cmd[0]){}
+	else if(my_strcmp(cmd,"help")==0){
 		vga_puts("Commands:\n");
-		vga_puts("  help        - Show this help\n");
-		vga_puts("  ver         - Show version\n");
-		vga_puts("  clear       - Clear screen\n");
-		vga_puts("  echo ..     - Echo text\n");
-		vga_puts("  uptime      - Show uptime\n");
-		vga_puts("  dir / ls    - List files\n");
-		vga_puts("  type FILE   - Display file\n");
-		vga_puts("  write FILE  - Create file\n");
-		vga_puts("  del FILE    - Delete file\n");
-		vga_puts("  mem         - Memory info\n");
-		vga_puts("  memtest     - Test malloc/free\n");
-		vga_puts("  clock       - Start clock task\n");
-		vga_puts("  ps          - List tasks\n");
-		vga_puts("  kill N      - Kill task N\n");
-	} else if (my_strcmp(cmd, "ver") == 0) {
-		vga_puts("Chocola Ver0.1\n");
-	} else if (my_strcmp(cmd, "clear") == 0) {
-		vga_clear();
-	} else if (starts_with(cmd, "echo ")) {
-		vga_puts(cmd + 5);
-		vga_putchar('\n');
-	} else if (my_strcmp(cmd, "echo") == 0) {
-		vga_putchar('\n');
-	} else if (my_strcmp(cmd, "uptime") == 0) {
-		unsigned t = ticks;
-		unsigned sec = t / TIMER_HZ;
-		unsigned min = sec / 60;
-		sec %= 60;
-		vga_putint(min);
-		vga_puts("m ");
-		vga_putint(sec);
-		vga_puts("s (");
-		vga_putint(t);
-		vga_puts(" ticks)\n");
-	} else if (my_strcmp(cmd, "dir") == 0 || my_strcmp(cmd, "ls") == 0) {
-		cmd_dir();
-	} else if (starts_with(cmd, "type ")) {
-		cmd_type(cmd + 5);
-	} else if (starts_with(cmd, "cat ")) {
-		cmd_type(cmd + 4);
-	} else if (starts_with(cmd, "write ")) {
-		cmd_write(cmd + 6);
-	} else if (starts_with(cmd, "del ")) {
-		cmd_del(cmd + 4);
-	} else if (my_strcmp(cmd, "mem") == 0) {
-		cmd_mem();
-	} else if (my_strcmp(cmd, "memtest") == 0) {
-		cmd_memtest();
-	} else if (my_strcmp(cmd, "clock") == 0) {
-		if (task_create(task_clock, "clock") >= 0)
-			vga_puts("Clock task started.\n");
-		else
-			vga_puts("Cannot create task (max reached).\n");
-	} else if (my_strcmp(cmd, "ps") == 0) {
-		cmd_ps();
-	} else if (starts_with(cmd, "kill ")) {
-		int id = cmd[5] - '0';
-		if (id > 0 && id < num_tasks && tasks[id].active) {
-			tasks[id].active = 0;
-			vga_puts("Killed task ");
-			vga_putint((unsigned)id);
-			vga_putchar('\n');
-		} else {
-			vga_puts("Invalid task ID.\n");
-		}
-	} else {
-		vga_puts("Unknown command: ");
-		vga_puts(cmd);
-		vga_putchar('\n');
+		vga_puts("  help ver clear echo uptime\n");
+		vga_puts("  dir ls type cat write del\n");
+		vga_puts("  mem memtest ps kill\n");
 	}
+	else if(my_strcmp(cmd,"ver")==0) vga_puts("Chocola Ver0.1\n");
+	else if(my_strcmp(cmd,"clear")==0) vga_clear();
+	else if(starts_with(cmd,"echo ")) { vga_puts(cmd+5); vga_putchar('\n'); }
+	else if(my_strcmp(cmd,"echo")==0) vga_putchar('\n');
+	else if(my_strcmp(cmd,"uptime")==0){
+		unsigned t=ticks,s=t/TIMER_HZ,m=s/60;s%=60;
+		vga_putint(m);vga_puts("m ");vga_putint(s);vga_puts("s (");vga_putint(t);vga_puts(" ticks)\n");
+	}
+	else if(my_strcmp(cmd,"dir")==0||my_strcmp(cmd,"ls")==0) cmd_dir();
+	else if(starts_with(cmd,"type ")) cmd_type(cmd+5);
+	else if(starts_with(cmd,"cat ")) cmd_type(cmd+4);
+	else if(starts_with(cmd,"write ")) cmd_write(cmd+6);
+	else if(starts_with(cmd,"del ")) cmd_del(cmd+4);
+	else if(my_strcmp(cmd,"mem")==0) cmd_mem();
+	else if(my_strcmp(cmd,"memtest")==0) cmd_memtest();
+	else if(my_strcmp(cmd,"ps")==0) cmd_ps();
+	else if(starts_with(cmd,"kill ")){
+		int id=cmd[5]-'0';
+		if(id>0&&id<num_tasks&&tasks[id].active){tasks[id].active=0;
+			vga_puts("Killed task ");vga_putint((unsigned)id);vga_putchar('\n');}
+		else vga_puts("Invalid task ID.\n");
+	}
+	else { vga_puts("Unknown: "); vga_puts(cmd); vga_putchar('\n'); }
 }
 
 static void shell_run(void)
 {
-	char buf[CMD_BUF_SIZE];
-	int pos;
-	char c;
-
-	for (;;) {
-		print_prompt();
-		pos = 0;
-
-		for (;;) {
-			c = kbd_getchar();
-
-			if (c == '\n') {
-				vga_putchar('\n');
-				buf[pos] = '\0';
-				break;
-			} else if (c == '\b') {
-				if (pos > 0) {
-					pos--;
-					vga_putchar('\b');
-				}
-			} else {
-				if (pos < CMD_BUF_SIZE - 1) {
-					buf[pos++] = c;
-					vga_putchar(c);
-				}
-			}
+	char buf[CMD_BUF_SIZE]; int pos; char c;
+	for(;;){
+		print_prompt(); pos=0;
+		for(;;){
+			c=kbd_getchar();
+			if(c=='\n'){vga_putchar('\n');buf[pos]=0;break;}
+			else if(c=='\b'){if(pos>0){pos--;vga_putchar('\b');}}
+			else if(pos<CMD_BUF_SIZE-1){buf[pos++]=c;vga_putchar(c);}
 		}
-
 		shell_exec(buf);
 	}
 }
@@ -910,17 +728,23 @@ static void shell_run(void)
 
 void kernel_main(void)
 {
-	vga_clear();
+	font = (const unsigned char *)(*(unsigned int *)0x4F8);
 
 	heap_init();
 	task_init_main();
 	pic_init();
 	pit_init(TIMER_HZ);
+	mouse_init();
+
 	idt_set_gate(0x20, (unsigned)isr_timer);
 	idt_set_gate(0x21, (unsigned)isr_keyboard);
-	__asm__ volatile ("sti");
+	idt_set_gate(0x2C, (unsigned)isr_mouse);
+	__asm__ volatile("sti");
+
+	desktop_init();
+	task_create(task_gui, "gui");
 
 	vga_puts("Chocola Ver0.1\n");
-	vga_puts("Type 'help' for available commands.\n\n");
+	vga_puts("Type 'help' for commands.\n\n");
 	shell_run();
 }
