@@ -1,5 +1,5 @@
 /*
- * chocola kernel (C) — VGA graphics mode (320x200x256)
+ * chocola kernel (C) — VGA graphics mode (640x480x256)
  * 32-bit protected mode, flat memory model.
  */
 
