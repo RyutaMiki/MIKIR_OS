@@ -22,6 +22,10 @@
 #define KBD_BUF_SIZE  32
 #define TIMER_HZ      100
 
+#define HIST_SIZE     16
+#define KEY_UP        '\x01'
+#define KEY_DOWN      '\x02'
+
 #define HEAP_START    0x200000
 #define HEAP_SIZE     0x200000
 
@@ -53,7 +57,7 @@ static inline void io_wait(void) { outb(0x80, 0); }
 /* ---- VBE banked framebuffer (640x480 at 0xA0000, 64KB window) ---- */
 
 static unsigned char *const fb_win = (unsigned char *)0xA0000;
-static int cur_bank = -1;
+static volatile int cur_bank = -1;
 
 static void vbe_set_bank(int bank)
 {
@@ -66,14 +70,21 @@ static void vbe_set_bank(int bank)
 
 static void fb_write(unsigned offset, unsigned char val)
 {
+	unsigned flags;
+	__asm__ volatile("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
 	vbe_set_bank((int)(offset / VGA_BANK_SIZE));
 	fb_win[offset % VGA_BANK_SIZE] = val;
+	__asm__ volatile("pushl %0; popfl" :: "r"(flags) : "memory");
 }
 
 static unsigned char fb_read(unsigned offset)
 {
+	unsigned flags; unsigned char v;
+	__asm__ volatile("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
 	vbe_set_bank((int)(offset / VGA_BANK_SIZE));
-	return fb_win[offset % VGA_BANK_SIZE];
+	v = fb_win[offset % VGA_BANK_SIZE];
+	__asm__ volatile("pushl %0; popfl" :: "r"(flags) : "memory");
+	return v;
 }
 
 /* ---- Scan code table ---- */
@@ -99,6 +110,16 @@ static volatile unsigned int ticks;
 
 static volatile int mouse_x = 160, mouse_y = 100;
 static volatile unsigned char mouse_btns;
+
+/* ---- GUI state (shared between timer ISR and scroll) ---- */
+
+static int gui_old_mx = -1, gui_old_my = -1;
+static volatile int gui_no_cursor;   /* when set, timer skips cursor update */
+
+/* ---- Command history ---- */
+
+static char history[HIST_SIZE][CMD_BUF_SIZE];
+static int  hist_count;
 
 /* ---- Disk / FS buffers ---- */
 
@@ -147,18 +168,88 @@ static void gfx_text(int x, int y, const char *s, unsigned char fg, unsigned cha
 	while (*s) { gfx_char(x, y, *s++, fg, bg); x += 8; }
 }
 
+/* ---- Mouse cursor (forward declarations for scroll) ---- */
+
+static void cursor_hide(int cx, int cy);
+static void cursor_show(int cx, int cy);
+
 /* ---- Console (character grid on framebuffer) ---- */
 
 static int cur_x, cur_y;
 
 static void vga_scroll(void)
 {
-	unsigned i, total = (unsigned)GFX_WIDTH * (unsigned)(CONSOLE_ROWS - 1) * (unsigned)CHAR_H;
+	unsigned total = (unsigned)GFX_WIDTH * (unsigned)(CONSOLE_ROWS - 1) * (unsigned)CHAR_H;
 	unsigned src_off = (unsigned)GFX_WIDTH * (unsigned)CHAR_H;
-	for (i = 0; i < total; i++)
-		fb_write(i, fb_read(i + src_off));
-	gfx_rect(0, (CONSOLE_ROWS - 1) * CHAR_H, GFX_WIDTH, CHAR_H, COL_BG);
+	unsigned flags, i;
+	int mx, my;
+
+	/* Prevent timer ISR from touching cursor during scroll */
+	gui_no_cursor = 1;
+	if (gui_old_mx >= 0)
+		cursor_hide(gui_old_mx, gui_old_my);
+
+	/* Disable interrupts — fast bulk copy with no per-pixel overhead */
+	__asm__ volatile("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
+
+	i = 0;
+	while (i < total) {
+		unsigned src = i + src_off;
+		int db = (int)(i   / VGA_BANK_SIZE);
+		int sb = (int)(src / VGA_BANK_SIZE);
+		unsigned dr = VGA_BANK_SIZE - (i   % VGA_BANK_SIZE);
+		unsigned sr = VGA_BANK_SIZE - (src % VGA_BANK_SIZE);
+		unsigned chunk = dr < sr ? dr : sr;
+		if (i + chunk > total) chunk = total - i;
+
+		if (sb == db) {
+			/* Same bank — fast 4-byte copy within window */
+			unsigned s = src % VGA_BANK_SIZE, d = i % VGA_BANK_SIZE;
+			unsigned j, w = chunk >> 2;
+			vbe_set_bank(db);
+			for (j = 0; j < w; j++)
+				((unsigned *)(fb_win + d))[j] = ((unsigned *)(fb_win + s))[j];
+			for (j = w << 2; j < chunk; j++)
+				fb_win[d + j] = fb_win[s + j];
+		} else {
+			/* Cross-bank — batch via temp buffer */
+			unsigned char tmp[512];
+			unsigned s = src % VGA_BANK_SIZE, d = i % VGA_BANK_SIZE;
+			unsigned done = 0;
+			while (done < chunk) {
+				unsigned batch = chunk - done, j;
+				if (batch > 512) batch = 512;
+				vbe_set_bank(sb);
+				for (j = 0; j < batch; j++) tmp[j] = fb_win[s + done + j];
+				vbe_set_bank(db);
+				for (j = 0; j < batch; j++) fb_win[d + done + j] = tmp[j];
+				done += batch;
+			}
+		}
+		i += chunk;
+	}
+
+	/* Clear last row (fits in one bank) */
+	{
+		unsigned start = (unsigned)(CONSOLE_ROWS - 1) * CHAR_H * GFX_WIDTH;
+		unsigned count = (unsigned)GFX_WIDTH * CHAR_H;
+		unsigned base = start % VGA_BANK_SIZE;
+		unsigned j, w = count >> 2;
+		vbe_set_bank((int)(start / VGA_BANK_SIZE));
+		for (j = 0; j < w; j++)
+			((unsigned *)(fb_win + base))[j] = COL_BG * 0x01010101u;
+		for (j = w << 2; j < count; j++)
+			fb_win[base + j] = COL_BG;
+	}
 	cur_y = CONSOLE_ROWS - 1;
+
+	__asm__ volatile("pushl %0; popfl" :: "r"(flags) : "memory");
+
+	/* Restore cursor at current mouse position */
+	mx = mouse_x; my = mouse_y;
+	cursor_show(mx, my);
+	gui_old_mx = mx; gui_old_my = my;
+	gui_no_cursor = 0;
 }
 
 static void vga_putchar(char c)
@@ -376,42 +467,6 @@ static void cursor_show(int cx, int cy)
 		}
 }
 
-/* GUI background task: taskbar clock + mouse cursor */
-static void task_gui(void)
-{
-	unsigned last_sec = 0xFFFFFFFF;
-	int old_mx = -1, old_my = -1;
-
-	for (;;) {
-		/* Update clock on taskbar */
-		unsigned t = ticks;
-		unsigned sec = t / TIMER_HZ;
-		if (sec != last_sec) {
-			unsigned min = sec / 60, hr = min / 60;
-			char tb[9];
-			sec %= 60; min %= 60;
-			tb[0] = '0'+hr/10; tb[1] = '0'+hr%10; tb[2] = ':';
-			tb[3] = '0'+min/10; tb[4] = '0'+min%10; tb[5] = ':';
-			tb[6] = '0'+sec/10; tb[7] = '0'+sec%10; tb[8] = 0;
-			gfx_text(GFX_WIDTH - 72, TASKBAR_Y + 9, tb, COL_TBTEXT, COL_TASKBAR);
-			last_sec = sec;
-		}
-
-		/* Mouse cursor — only move when position changes, atomic to avoid flicker */
-		{
-			int mx = mouse_x, my = mouse_y;
-			if (mx != old_mx || my != old_my) {
-				__asm__ volatile("cli");
-				if (old_mx >= 0) cursor_hide(old_mx, old_my);
-				cursor_show(mx, my);
-				old_mx = mx; old_my = my;
-				__asm__ volatile("sti");
-			}
-		}
-		__asm__ volatile("hlt");
-	}
-}
-
 /* ---- Interrupt handlers ---- */
 
 extern void isr_timer(void);
@@ -420,20 +475,75 @@ extern void isr_mouse(void);
 
 unsigned timer_handler(unsigned esp)
 {
-	int next;
+	static unsigned gui_last_sec = 0xFFFFFFFF;
+	int saved_bank = cur_bank;          /* save shell's bank state */
+
 	ticks++;
+
+	/* ---- GUI: clock (once per second) ---- */
+	{
+		unsigned total_sec = ticks / TIMER_HZ;
+		if (total_sec != gui_last_sec) {
+			unsigned sec = total_sec % 60;
+			unsigned min = (total_sec / 60) % 60;
+			unsigned hr  = total_sec / 3600;
+			char tb[9];
+			tb[0] = '0'+hr/10; tb[1] = '0'+hr%10; tb[2] = ':';
+			tb[3] = '0'+min/10; tb[4] = '0'+min%10; tb[5] = ':';
+			tb[6] = '0'+sec/10; tb[7] = '0'+sec%10; tb[8] = 0;
+			gfx_text(GFX_WIDTH - 72, TASKBAR_Y + 9, tb, COL_TBTEXT, COL_TASKBAR);
+			gui_last_sec = total_sec;
+		}
+	}
+
+	/* ---- GUI: mouse cursor (skip during scroll) ---- */
+	if (!gui_no_cursor) {
+		int mx = mouse_x, my = mouse_y;
+		if (mx != gui_old_mx || my != gui_old_my) {
+			if (gui_old_mx >= 0) cursor_hide(gui_old_mx, gui_old_my);
+			cursor_show(mx, my);
+			gui_old_mx = mx; gui_old_my = my;
+		}
+	}
+
+	cur_bank = saved_bank;              /* restore shell's bank state */
+	if (saved_bank >= 0) {              /* restore hardware bank too */
+		outw(0x1CE, 0x05);
+		outw(0x1CF, (unsigned short)saved_bank);
+	}
+
+	/* ---- Task switching ---- */
 	if (num_tasks <= 1) return esp;
 	tasks[current_task].esp = esp;
-	next = current_task;
-	do { next = (next+1) % num_tasks; } while (!tasks[next].active && next != current_task);
-	current_task = next;
+	{
+		int next = current_task;
+		do { next = (next+1) % num_tasks; } while (!tasks[next].active && next != current_task);
+		current_task = next;
+	}
 	return tasks[current_task].esp;
 }
 
 void keyboard_handler(void)
 {
+	static int e0_flag = 0;
 	unsigned char sc = inb(0x60);
 	int next;
+
+	if (sc == 0xE0) { e0_flag = 1; return; }
+
+	if (e0_flag) {
+		e0_flag = 0;
+		if (sc & 0x80) return;          /* release of extended key */
+		char ch = 0;
+		if (sc == 0x48) ch = KEY_UP;    /* up arrow */
+		else if (sc == 0x50) ch = KEY_DOWN; /* down arrow */
+		if (ch) {
+			next = (kbd_head+1) % KBD_BUF_SIZE;
+			if (next != kbd_tail) { kbd_buf[kbd_head] = ch; kbd_head = next; }
+		}
+		return;
+	}
+
 	if (sc & 0x80) return;
 	if (sc < sizeof(sc_to_ascii) && sc_to_ascii[sc]) {
 		next = (kbd_head+1) % KBD_BUF_SIZE;
@@ -680,9 +790,17 @@ static void shell_exec(char *cmd)
 	if(!cmd[0]){}
 	else if(my_strcmp(cmd,"help")==0){
 		vga_puts("Commands:\n");
-		vga_puts("  help ver clear echo uptime\n");
+		vga_puts("  help ver clear echo uptime history\n");
 		vga_puts("  dir ls type cat write del\n");
 		vga_puts("  mem memtest ps kill\n");
+	}
+	else if(my_strcmp(cmd,"history")==0){
+		int i;
+		if(hist_count==0){ vga_puts("(no history)\n"); }
+		else for(i=0;i<hist_count;i++){
+			vga_puts("  ");vga_putint((unsigned)(i+1));vga_puts("  ");
+			vga_puts(history[i]);vga_putchar('\n');
+		}
 	}
 	else if(my_strcmp(cmd,"ver")==0) vga_puts("Chocola Ver0.1\n");
 	else if(my_strcmp(cmd,"clear")==0) vga_clear();
@@ -711,13 +829,48 @@ static void shell_exec(char *cmd)
 
 static void shell_run(void)
 {
-	char buf[CMD_BUF_SIZE]; int pos; char c;
+	char buf[CMD_BUF_SIZE]; int pos, hist_nav, i; char c;
 	for(;;){
-		print_prompt(); pos=0;
+		print_prompt(); pos=0; hist_nav=hist_count;
 		for(;;){
 			c=kbd_getchar();
-			if(c=='\n'){vga_putchar('\n');buf[pos]=0;break;}
+			if(c=='\n'){
+				vga_putchar('\n'); buf[pos]=0;
+				/* save non-empty command to history */
+				if(pos>0){
+					if(hist_count>=HIST_SIZE){
+						for(i=0;i<HIST_SIZE-1;i++) my_strcpy(history[i],history[i+1]);
+						hist_count=HIST_SIZE-1;
+					}
+					my_strcpy(history[hist_count],buf);
+					hist_count++;
+				}
+				break;
+			}
 			else if(c=='\b'){if(pos>0){pos--;vga_putchar('\b');}}
+			else if(c==KEY_UP){
+				if(hist_nav>0){
+					hist_nav--;
+					for(i=0;i<pos;i++) vga_putchar('\b');
+					my_strcpy(buf, history[hist_nav]);
+					pos=0; while(buf[pos]) pos++;
+					vga_puts(buf);
+				}
+			}
+			else if(c==KEY_DOWN){
+				if(hist_nav<hist_count-1){
+					hist_nav++;
+					for(i=0;i<pos;i++) vga_putchar('\b');
+					my_strcpy(buf, history[hist_nav]);
+					pos=0; while(buf[pos]) pos++;
+					vga_puts(buf);
+				}
+				else if(hist_nav<hist_count){
+					hist_nav=hist_count;
+					for(i=0;i<pos;i++) vga_putchar('\b');
+					pos=0; buf[0]=0;
+				}
+			}
 			else if(pos<CMD_BUF_SIZE-1){buf[pos++]=c;vga_putchar(c);}
 		}
 		shell_exec(buf);
@@ -742,7 +895,6 @@ void kernel_main(void)
 	__asm__ volatile("sti");
 
 	desktop_init();
-	task_create(task_gui, "gui");
 
 	vga_puts("Chocola Ver0.1\n");
 	vga_puts("Type 'help' for commands.\n\n");
